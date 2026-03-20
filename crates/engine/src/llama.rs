@@ -330,34 +330,90 @@ fn load_tensor_f32(gguf: &GgufFile, info: &TensorInfo) -> Vec<f32> {
     }
 }
 
+/// A weight matrix on GPU — may be quantized or F32.
+pub struct WeightTensor {
+    pub buf: GpuTensor,
+    pub dtype: GgmlType,
+    pub m: usize, // output dim (rows)
+    pub k: usize, // input dim (cols)
+}
+
 /// GPU-resident LLaMA model weights.
 pub struct LlamaWeights {
-    pub token_embd: GpuTensor,
+    pub token_embd: GpuTensor, // always F32 (for embedding lookup)
     pub output_norm: GpuTensor,
-    pub output: GpuTensor,
+    pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
 }
 
 pub struct LayerWeights {
     pub attn_norm: GpuTensor,
-    pub wq: GpuTensor,
-    pub wk: GpuTensor,
-    pub wv: GpuTensor,
-    pub wo: GpuTensor,
+    pub wq: WeightTensor,
+    pub wk: WeightTensor,
+    pub wv: WeightTensor,
+    pub wo: WeightTensor,
     pub q_norm: Option<GpuTensor>, // Qwen3: per-head Q normalization
     pub k_norm: Option<GpuTensor>, // Qwen3: per-head K normalization
     pub ffn_norm: GpuTensor,
-    pub w_gate: GpuTensor,
-    pub w_up: GpuTensor,
-    pub w_down: GpuTensor,
+    pub w_gate: WeightTensor,
+    pub w_up: WeightTensor,
+    pub w_down: WeightTensor,
 }
 
-/// Load LLaMA weights from GGUF onto GPU, dequantizing to F32.
+/// Dispatch GEMV for a weight tensor (quantized or F32).
+/// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
+pub fn weight_gemv(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+) -> HipResult<()> {
+    match w.dtype {
+        GgmlType::F32 => gpu.gemv_f32(&w.buf, x, y),
+        GgmlType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
+        GgmlType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
+        GgmlType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
+        other => {
+            // Fallback: dequantize to F32 on CPU, upload, GEMV
+            eprintln!("WARNING: no GPU kernel for {:?}, falling back to CPU dequant", other);
+            Err(hip_bridge::HipError::new(0, &format!("unsupported quant type {:?}", other)))
+        }
+    }
+}
+
+/// Load LLaMA weights from GGUF onto GPU.
+/// Quantized weights stay quantized (Q4_K, Q6_K, Q8_0).
+/// Only norm weights and embeddings are dequantized to F32.
 pub fn load_weights(
     gguf: &GgufFile,
     config: &LlamaConfig,
     gpu: &Gpu,
 ) -> HipResult<LlamaWeights> {
+    // Upload F32 tensor (for norms, embeddings)
+    let upload_f32 = |name: &str, expected_shape: &[usize]| -> HipResult<GpuTensor> {
+        let info = gguf
+            .find_tensor(name)
+            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        let data = load_tensor_f32(gguf, info);
+        gpu.upload_f32(&data, expected_shape)
+    };
+
+    // Upload weight matrix — keep native quantization on GPU
+    let upload_weight = |name: &str, m: usize, k: usize| -> HipResult<WeightTensor> {
+        let info = gguf
+            .find_tensor(name)
+            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        let raw_data = gguf.tensor_data(info);
+        let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
+        Ok(WeightTensor {
+            buf,
+            dtype: info.dtype,
+            m,
+            k,
+        })
+    };
+
+    // For weight matrices that might be F32 (norm weights are always F32)
     let upload = |name: &str, expected_shape: &[usize]| -> HipResult<GpuTensor> {
         let info = gguf
             .find_tensor(name)
@@ -367,19 +423,21 @@ pub fn load_weights(
     };
 
     eprintln!("  loading token_embd...");
-    let token_embd = upload("token_embd.weight", &[config.vocab_size, config.dim])?;
+    // Token embeddings always F32 (for CPU-side lookup)
+    let token_embd = upload_f32("token_embd.weight", &[config.vocab_size, config.dim])?;
     eprintln!("  loading output_norm...");
-    let output_norm = upload("output_norm.weight", &[config.dim])?;
+    let output_norm = upload_f32("output_norm.weight", &[config.dim])?;
 
-    // output.weight may or may not exist (tied embeddings)
+    // output.weight — keep quantized
     eprintln!("  loading output...");
     let output = if gguf.find_tensor("output.weight").is_some() {
-        upload("output.weight", &[config.vocab_size, config.dim])?
+        upload_weight("output.weight", config.vocab_size, config.dim)?
     } else {
-        // Tied embeddings — reuse token_embd data
+        // Tied embeddings — reuse token_embd data as F32
         let info = gguf.find_tensor("token_embd.weight").unwrap();
         let data = load_tensor_f32(gguf, info);
-        gpu.upload_f32(&data, &[config.vocab_size, config.dim])?
+        let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
+        WeightTensor { buf, dtype: GgmlType::F32, m: config.vocab_size, k: config.dim }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -388,45 +446,29 @@ pub fn load_weights(
         let p = format!("blk.{i}");
         let kv_dim = config.n_kv_heads * config.head_dim;
 
-        // Qwen3: Q/K output dim may differ from dim if head_dim != dim/n_heads
         let q_out_dim = config.n_heads * config.head_dim;
-        let k_out_dim = config.n_kv_heads * config.head_dim;
+        let _k_out_dim = config.n_kv_heads * config.head_dim;
 
         let layer = LayerWeights {
-            attn_norm: upload(&format!("{p}.attn_norm.weight"), &[config.dim])?,
-            wq: upload(
-                &format!("{p}.attn_q.weight"),
-                &[q_out_dim, config.dim],
-            )?,
-            wk: upload(&format!("{p}.attn_k.weight"), &[kv_dim, config.dim])?,
-            wv: upload(&format!("{p}.attn_v.weight"), &[kv_dim, config.dim])?,
-            wo: upload(
-                &format!("{p}.attn_output.weight"),
-                &[config.dim, q_out_dim],
-            )?,
+            attn_norm: upload_f32(&format!("{p}.attn_norm.weight"), &[config.dim])?,
+            wq: upload_weight(&format!("{p}.attn_q.weight"), q_out_dim, config.dim)?,
+            wk: upload_weight(&format!("{p}.attn_k.weight"), kv_dim, config.dim)?,
+            wv: upload_weight(&format!("{p}.attn_v.weight"), kv_dim, config.dim)?,
+            wo: upload_weight(&format!("{p}.attn_output.weight"), config.dim, q_out_dim)?,
             q_norm: if config.has_qk_norm {
-                Some(upload(&format!("{p}.attn_q_norm.weight"), &[config.head_dim])?)
+                Some(upload_f32(&format!("{p}.attn_q_norm.weight"), &[config.head_dim])?)
             } else {
                 None
             },
             k_norm: if config.has_qk_norm {
-                Some(upload(&format!("{p}.attn_k_norm.weight"), &[config.head_dim])?)
+                Some(upload_f32(&format!("{p}.attn_k_norm.weight"), &[config.head_dim])?)
             } else {
                 None
             },
-            ffn_norm: upload(&format!("{p}.ffn_norm.weight"), &[config.dim])?,
-            w_gate: upload(
-                &format!("{p}.ffn_gate.weight"),
-                &[config.hidden_dim, config.dim],
-            )?,
-            w_up: upload(
-                &format!("{p}.ffn_up.weight"),
-                &[config.hidden_dim, config.dim],
-            )?,
-            w_down: upload(
-                &format!("{p}.ffn_down.weight"),
-                &[config.dim, config.hidden_dim],
-            )?,
+            ffn_norm: upload_f32(&format!("{p}.ffn_norm.weight"), &[config.dim])?,
+            w_gate: upload_weight(&format!("{p}.ffn_gate.weight"), config.hidden_dim, config.dim)?,
+            w_up: upload_weight(&format!("{p}.ffn_up.weight"), config.hidden_dim, config.dim)?,
+            w_down: upload_weight(&format!("{p}.ffn_down.weight"), config.dim, config.hidden_dim)?,
         };
         layers.push(layer);
     }
@@ -475,9 +517,9 @@ pub fn forward(
         let k = gpu.zeros(&[kv_dim], DType::F32)?;
         let v = gpu.zeros(&[kv_dim], DType::F32)?;
 
-        gpu.gemv_f32(&layer.wq, &tmp, &q)?;
-        gpu.gemv_f32(&layer.wk, &tmp, &k)?;
-        gpu.gemv_f32(&layer.wv, &tmp, &v)?;
+        weight_gemv(gpu, &layer.wq, &tmp, &q)?;
+        weight_gemv(gpu, &layer.wk, &tmp, &k)?;
+        weight_gemv(gpu, &layer.wv, &tmp, &v)?;
 
         // QK normalization (Qwen3: RMSNorm per-head before RoPE)
         let mut q_data = gpu.download_f32(&q)?;
@@ -521,7 +563,7 @@ pub fn forward(
 
         // Output projection: o = Wo * attn_out
         let o = gpu.zeros(&[dim], DType::F32)?;
-        gpu.gemv_f32(&layer.wo, &attn_gpu, &o)?;
+        weight_gemv(gpu, &layer.wo, &attn_gpu, &o)?;
         gpu.free_tensor(attn_gpu)?;
 
         // Residual: x = x + o
@@ -536,8 +578,8 @@ pub fn forward(
 
         let gate = gpu.zeros(&[config.hidden_dim], DType::F32)?;
         let up = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        gpu.gemv_f32(&layer.w_gate, &tmp, &gate)?;
-        gpu.gemv_f32(&layer.w_up, &tmp, &up)?;
+        weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
+        weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
 
         // SiLU(gate) * up
         let gate_act = gpu.zeros(&[config.hidden_dim], DType::F32)?;
@@ -551,7 +593,7 @@ pub fn forward(
 
         // Down projection
         let ffn_out = gpu.zeros(&[dim], DType::F32)?;
-        gpu.gemv_f32(&layer.w_down, &ffn_hidden, &ffn_out)?;
+        weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
         gpu.free_tensor(ffn_hidden)?;
 
         // Residual
@@ -567,7 +609,7 @@ pub fn forward(
 
     // Logits: output = output_weight * x
     let logits = gpu.zeros(&[config.vocab_size], DType::F32)?;
-    gpu.gemv_f32(&weights.output, &tmp, &logits)?;
+    weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
     let logits_data = gpu.download_f32(&logits)?;
     gpu.free_tensor(x)?;
