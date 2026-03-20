@@ -240,7 +240,7 @@ impl Gpu {
         ];
 
         let block_size = 256u32;
-        let shared_mem = 8 * 4; // only 8 floats for cross-warp reduction
+        let shared_mem = 8 * 4; // 8 floats for cross-warp reduction
         unsafe {
             self.hip.launch_kernel(
                 func,

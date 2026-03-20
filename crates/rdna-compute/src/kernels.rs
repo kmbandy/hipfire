@@ -92,8 +92,8 @@ __device__ __forceinline__ float half_to_float(unsigned short h) {
     return __int_as_float((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13));
 }
 
-// Q4_K GEMV v5: 256 threads, native half, warp shuffle reduction.
-// Key optimization: __shfl_down for intra-warp reduction eliminates most __syncthreads.
+// Q4_K GEMV v5: 256 threads, native half, warp shuffle reduction, max registers.
+__launch_bounds__(256, 1)
 extern "C" __global__ void gemv_q4k(
     const unsigned char* __restrict__ A_q4k,
     const float* __restrict__ x,
@@ -101,10 +101,9 @@ extern "C" __global__ void gemv_q4k(
     int M, int K
 ) {
     extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     if (row >= M) return;
-    const int tid = threadIdx.x; // 0..255
+    const int tid = threadIdx.x;
 
     const int blocks_per_row = K / 256;
     const unsigned char* row_data = A_q4k + (size_t)row * blocks_per_row * 144;
@@ -118,13 +117,10 @@ extern "C" __global__ void gemv_q4k(
 
     for (int bi = 0; bi < blocks_per_row; bi++) {
         const unsigned char* block = row_data + bi * 144;
-
-        // Native half load
         float d = (float)*((const _Float16*)block);
         float dmin = (float)*((const _Float16*)(block + 2));
-
-        // Scale decode (branches uniform per wavefront — no divergence)
         const unsigned char* sc = block + 4;
+
         float fscale, fmin;
         if (sb < 4) {
             fscale = d * (float)(sc[sb] & 63);
@@ -135,32 +131,22 @@ extern "C" __global__ void gemv_q4k(
             fmin = dmin * (float)((sc[8+i] >> 4) | ((sc[4+i] >> 6) << 4));
         }
 
-        // Coalesced byte load within each group's wavefront
         unsigned char qbyte = block[16 + (group << 5) + lane];
         float w = fscale * (float)(sub_in_group == 0 ? (qbyte & 0xF) : (qbyte >> 4)) - fmin;
         sum += w * x[bi * 256 + tid];
     }
 
-    // Warp shuffle reduction (no shared memory sync needed within wavefront)
+    // Warp shuffle then cross-warp via shared mem
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_down(sum, offset);
     }
-
-    // Lane 0 of each wavefront writes to shared memory
-    if (lane == 0) {
-        sdata[tid >> 5] = sum;  // 8 values for 256/32 wavefronts
-    }
+    if (lane == 0) sdata[tid >> 5] = sum;
     __syncthreads();
-
-    // Final reduction by first 8 threads
     if (tid < 8) {
         sum = sdata[tid];
-        for (int offset = 4; offset > 0; offset >>= 1) {
+        for (int offset = 4; offset > 0; offset >>= 1)
             sum += __shfl_down(sum, offset);
-        }
-        if (tid == 0) {
-            y[row] = sum;
-        }
+        if (tid == 0) y[row] = sum;
     }
 }
 "#;
