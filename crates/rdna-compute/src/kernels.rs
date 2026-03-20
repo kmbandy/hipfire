@@ -92,26 +92,20 @@ __device__ __forceinline__ float half_to_float(unsigned short h) {
     return __int_as_float((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13));
 }
 
-// Q4_K GEMV v5: 256 threads, native half, warp shuffle reduction, max registers.
-__launch_bounds__(256, 1)
+// Q4_K GEMV v6: 32 threads (single warp), 8 elements per thread per Q4K block.
+// No shared memory needed — warp shuffle only. Higher occupancy.
 extern "C" __global__ void gemv_q4k(
     const unsigned char* __restrict__ A_q4k,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M, int K
 ) {
-    extern __shared__ float sdata[];
     const int row = blockIdx.x;
     if (row >= M) return;
     const int tid = threadIdx.x;
 
     const int blocks_per_row = K / 256;
     const unsigned char* row_data = A_q4k + (size_t)row * blocks_per_row * 144;
-
-    const int group = tid >> 6;
-    const int sub_in_group = (tid >> 5) & 1;
-    const int sb = (group << 1) | sub_in_group;
-    const int lane = tid & 31;
 
     float sum = 0.0f;
 
@@ -120,34 +114,62 @@ extern "C" __global__ void gemv_q4k(
         float d = (float)*((const _Float16*)block);
         float dmin = (float)*((const _Float16*)(block + 2));
         const unsigned char* sc = block + 4;
+        const float* xb = x + bi * 256;
 
-        float fscale, fmin;
-        if (sb < 4) {
-            fscale = d * (float)(sc[sb] & 63);
-            fmin = dmin * (float)(sc[4 + sb] & 63);
-        } else {
-            int i = sb - 4;
-            fscale = d * (float)((sc[8+i] & 0xF) | ((sc[i] >> 6) << 4));
-            fmin = dmin * (float)((sc[8+i] >> 4) | ((sc[4+i] >> 6) << 4));
+        // Group 0: elements 0-63
+        {
+            unsigned char qbyte = block[16 + tid];
+            float s0 = d * (float)(sc[0] & 63);
+            float m0 = dmin * (float)(sc[4] & 63);
+            sum += (s0 * (float)(qbyte & 0xF) - m0) * xb[tid];
+
+            float s1 = d * (float)(sc[1] & 63);
+            float m1 = dmin * (float)(sc[5] & 63);
+            sum += (s1 * (float)(qbyte >> 4) - m1) * xb[32 + tid];
         }
 
-        unsigned char qbyte = block[16 + (group << 5) + lane];
-        float w = fscale * (float)(sub_in_group == 0 ? (qbyte & 0xF) : (qbyte >> 4)) - fmin;
-        sum += w * x[bi * 256 + tid];
+        // Group 1: elements 64-127
+        {
+            unsigned char qbyte = block[48 + tid];
+            float s2 = d * (float)(sc[2] & 63);
+            float m2 = dmin * (float)(sc[6] & 63);
+            sum += (s2 * (float)(qbyte & 0xF) - m2) * xb[64 + tid];
+
+            float s3 = d * (float)(sc[3] & 63);
+            float m3 = dmin * (float)(sc[7] & 63);
+            sum += (s3 * (float)(qbyte >> 4) - m3) * xb[96 + tid];
+        }
+
+        // Group 2: elements 128-191 (different scale encoding)
+        {
+            unsigned char qbyte = block[80 + tid];
+            float s4 = d * (float)((sc[8] & 0xF) | ((sc[0] >> 6) << 4));
+            float m4 = dmin * (float)((sc[8] >> 4) | ((sc[4] >> 6) << 4));
+            sum += (s4 * (float)(qbyte & 0xF) - m4) * xb[128 + tid];
+
+            float s5 = d * (float)((sc[9] & 0xF) | ((sc[1] >> 6) << 4));
+            float m5 = dmin * (float)((sc[9] >> 4) | ((sc[5] >> 6) << 4));
+            sum += (s5 * (float)(qbyte >> 4) - m5) * xb[160 + tid];
+        }
+
+        // Group 3: elements 192-255
+        {
+            unsigned char qbyte = block[112 + tid];
+            float s6 = d * (float)((sc[10] & 0xF) | ((sc[2] >> 6) << 4));
+            float m6 = dmin * (float)((sc[10] >> 4) | ((sc[6] >> 6) << 4));
+            sum += (s6 * (float)(qbyte & 0xF) - m6) * xb[192 + tid];
+
+            float s7 = d * (float)((sc[11] & 0xF) | ((sc[3] >> 6) << 4));
+            float m7 = dmin * (float)((sc[11] >> 4) | ((sc[7] >> 6) << 4));
+            sum += (s7 * (float)(qbyte >> 4) - m7) * xb[224 + tid];
+        }
     }
 
-    // Warp shuffle then cross-warp via shared mem
+    // Warp shuffle reduction (5 steps, no shared memory)
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_down(sum, offset);
     }
-    if (lane == 0) sdata[tid >> 5] = sum;
-    __syncthreads();
-    if (tid < 8) {
-        sum = sdata[tid];
-        for (int offset = 4; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
-        if (tid == 0) y[row] = sum;
-    }
+    if (tid == 0) y[row] = sum;
 }
 "#;
 
