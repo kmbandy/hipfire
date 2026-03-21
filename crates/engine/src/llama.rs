@@ -683,17 +683,23 @@ pub fn forward(
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
 
+    // Pre-allocate scratch buffers — reused every layer (eliminates 324 allocs per token)
+    let q_dim = n_heads * head_dim;
+    let q = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+    let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let v = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+    let o = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let gate = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+    let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+    let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+    let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
+
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
 
         // RMSNorm before attention
         gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
-
-        // Q, K, V projections
-        let q_dim = n_heads * head_dim;
-        let q = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-        let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-        let v = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
 
         // Fused QKV: 3 GEMVs in 1 kernel launch (saves 2 launches per layer)
         if layer.wq.gpu_dtype == DType::Q4K
@@ -738,38 +744,26 @@ pub fn forward(
             &v.buf, 0,
             kv_dim * 4,
         )?;
-        gpu.free_tensor(k)?;
-        gpu.free_tensor(v)?;
-
         // GPU-side attention
-        let attn_gpu = gpu.alloc_tensor(&[q_dim], DType::F32)?;
         gpu.attention_f32(
             &q,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
-            &attn_gpu,
+            &attn_out,
             pos + 1,
             n_heads,
             n_kv_heads,
             head_dim,
             kv_cache.max_seq,
         )?;
-        gpu.free_tensor(q)?;
-
         // Output projection: o = Wo * attn_out
-        let o = gpu.alloc_tensor(&[dim], DType::F32)?;
-        weight_gemv(gpu, &layer.wo, &attn_gpu, &o)?;
-        gpu.free_tensor(attn_gpu)?;
+        weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
 
         // Residual: x += o (in-place)
         gpu.add_inplace_f32(&x, &o)?;
-        gpu.free_tensor(o)?;
 
         // FFN
         gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
-
-        let gate = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
-        let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
         // Fused Gate+Up: 2 GEMVs in 1 kernel launch
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
@@ -783,20 +777,14 @@ pub fn forward(
             weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
         }
 
-        // Fused SiLU(gate) * up — saves one kernel launch + intermediate buffer
-        let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+        // Fused SiLU(gate) * up
         gpu.silu_mul_f32(&gate, &up, &ffn_hidden)?;
-        gpu.free_tensor(gate)?;
-        gpu.free_tensor(up)?;
 
         // Down projection
-        let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
         weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
-        gpu.free_tensor(ffn_hidden)?;
 
         // Residual: x += ffn_out (in-place)
         gpu.add_inplace_f32(&x, &ffn_out)?;
-        gpu.free_tensor(ffn_out)?;
     }
 
     // Final norm
@@ -807,6 +795,15 @@ pub fn forward(
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
     let logits_data = gpu.download_f32(&logits)?;
+    gpu.free_tensor(q)?;
+    gpu.free_tensor(k)?;
+    gpu.free_tensor(v)?;
+    gpu.free_tensor(attn_out)?;
+    gpu.free_tensor(o)?;
+    gpu.free_tensor(gate)?;
+    gpu.free_tensor(up)?;
+    gpu.free_tensor(ffn_hidden)?;
+    gpu.free_tensor(ffn_out)?;
     gpu.free_tensor(x)?;
     gpu.free_tensor(tmp)?;
     gpu.free_tensor(logits)?;
