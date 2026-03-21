@@ -147,6 +147,39 @@ impl Gpu {
         self.hip.memcpy_dtod_offset(&output.buf, &table.buf, byte_offset, byte_size)
     }
 
+    /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
+    pub fn gemv_q4lut(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4lut", kernels::GEMV_Q4LUT_SRC, "gemv_q4lut")?;
+        let func = &self.functions["gemv_q4lut"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        // LDS: 8 codebooks × 16 entries × 2 bytes = 256 bytes
+        let shared_mem = 256u32;
+        unsafe {
+            self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], shared_mem, None, &mut params)
+        }
+    }
+
     /// Q8_0 embedding lookup: dequantize one row on GPU, output F32.
     pub fn embedding_lookup_q8(
         &mut self,
