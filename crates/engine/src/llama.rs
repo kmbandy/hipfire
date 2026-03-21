@@ -915,51 +915,60 @@ pub fn argmax(logits: &[f32]) -> u32 {
         .unwrap()
 }
 
-/// Sample the next token using temperature + top-p (nucleus) sampling.
-/// Qwen3 recommended: temperature=0.7, top_p=0.8
+/// Sample the next token using temperature + top-k + top-p (nucleus) sampling.
+/// Qwen3 recommended: temperature=0.7, top_k=20, top_p=0.8
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
-    use std::collections::BinaryHeap;
-    use std::cmp::Ordering;
+    const TOP_K: usize = 20;
 
-    // Apply temperature
+    // Single pass: find top-K candidates via min-heap + compute softmax denominator
     let inv_temp = 1.0 / temperature;
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let probs: Vec<f32> = logits.iter()
-        .map(|&l| ((l - max_logit) * inv_temp).exp())
+
+    // Min-heap of (score, index) — keeps the K largest
+    let mut topk = Vec::with_capacity(TOP_K + 1);
+    for (i, &l) in logits.iter().enumerate() {
+        let score = (l - max_logit) * inv_temp;
+        if topk.len() < TOP_K {
+            topk.push((score, i as u32));
+            if topk.len() == TOP_K {
+                // Heapify: sort so min is at [0]
+                topk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            }
+        } else if score > topk[0].0 {
+            topk[0] = (score, i as u32);
+            // Bubble down to maintain min-heap property
+            let mut pos = 0;
+            loop {
+                let left = 2 * pos + 1;
+                let right = 2 * pos + 2;
+                let mut smallest = pos;
+                if left < TOP_K && topk[left].0 < topk[smallest].0 { smallest = left; }
+                if right < TOP_K && topk[right].0 < topk[smallest].0 { smallest = right; }
+                if smallest == pos { break; }
+                topk.swap(pos, smallest);
+                pos = smallest;
+            }
+        }
+    }
+
+    // Convert to probabilities and sort descending
+    let mut candidates: Vec<(f32, u32)> = topk.iter()
+        .map(|&(score, idx)| (score.exp(), idx))
         .collect();
-    let sum: f32 = probs.iter().sum();
-    let probs: Vec<f32> = probs.iter().map(|p| p / sum).collect();
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
-    // Sort by probability descending (index, prob)
-    #[derive(PartialEq)]
-    struct Candidate(f32, u32);
-    impl Eq for Candidate {}
-    impl PartialOrd for Candidate {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            self.0.partial_cmp(&other.0)
-        }
-    }
-    impl Ord for Candidate {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.partial_cmp(other).unwrap_or(Ordering::Equal)
-        }
-    }
-
-    let mut heap = BinaryHeap::with_capacity(probs.len());
-    for (i, &p) in probs.iter().enumerate() {
-        heap.push(Candidate(p, i as u32));
-    }
-
-    // Accumulate until we exceed top_p
+    // Top-p filtering
+    let sum: f32 = candidates.iter().map(|(p, _)| p).sum();
     let mut cumulative = 0.0f32;
-    let mut candidates: Vec<(f32, u32)> = Vec::new();
-    while let Some(Candidate(p, idx)) = heap.pop() {
-        cumulative += p;
-        candidates.push((p, idx));
+    let mut n_keep = candidates.len();
+    for (i, &(p, _)) in candidates.iter().enumerate() {
+        cumulative += p / sum;
         if cumulative >= top_p {
+            n_keep = i + 1;
             break;
         }
     }
+    candidates.truncate(n_keep);
 
     // Renormalize and sample
     let cand_sum: f32 = candidates.iter().map(|(p, _)| p).sum();
