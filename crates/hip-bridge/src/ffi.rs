@@ -12,6 +12,8 @@ type HipStream = *mut c_void;
 type HipModule = *mut c_void;
 type HipFunction = *mut c_void;
 type HipEvent = *mut c_void;
+type HipGraph = *mut c_void;
+type HipGraphExec = *mut c_void;
 
 const HIP_SUCCESS: u32 = 0;
 
@@ -65,6 +67,19 @@ pub struct HipRuntime {
     // Error
     fn_get_error_string: unsafe extern "C" fn(u32) -> *const i8,
     fn_get_last_error: unsafe extern "C" fn() -> u32,
+
+    // Graph capture & replay
+    fn_stream_begin_capture:
+        unsafe extern "C" fn(HipStream, c_uint) -> u32,
+    fn_stream_end_capture:
+        unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
+    fn_graph_instantiate:
+        unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32,
+    fn_graph_launch:
+        unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
+    fn_graph_exec_destroy: unsafe extern "C" fn(HipGraphExec) -> u32,
+    fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
+    fn_device_synchronize: unsafe extern "C" fn() -> u32,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -116,6 +131,13 @@ impl HipRuntime {
                 fn_event_destroy: load_fn!(lib, "hipEventDestroy", unsafe extern "C" fn(HipEvent) -> u32),
                 fn_get_error_string: load_fn!(lib, "hipGetErrorString", unsafe extern "C" fn(u32) -> *const i8),
                 fn_get_last_error: load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32),
+                fn_stream_begin_capture: load_fn!(lib, "hipStreamBeginCapture", unsafe extern "C" fn(HipStream, c_uint) -> u32),
+                fn_stream_end_capture: load_fn!(lib, "hipStreamEndCapture", unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32),
+                fn_graph_instantiate: load_fn!(lib, "hipGraphInstantiate", unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32),
+                fn_graph_launch: load_fn!(lib, "hipGraphLaunch", unsafe extern "C" fn(HipGraphExec, HipStream) -> u32),
+                fn_graph_exec_destroy: load_fn!(lib, "hipGraphExecDestroy", unsafe extern "C" fn(HipGraphExec) -> u32),
+                fn_graph_destroy: load_fn!(lib, "hipGraphDestroy", unsafe extern "C" fn(HipGraph) -> u32),
+                fn_device_synchronize: load_fn!(lib, "hipDeviceSynchronize", unsafe extern "C" fn() -> u32),
                 _lib: lib,
             })
         }
@@ -448,6 +470,56 @@ impl HipRuntime {
         };
         self.check(code, "hipMemcpyAsync D2H")
     }
+
+    // ── Graph capture & replay ──────────────────────────────────
+
+    /// Begin capturing all operations on `stream` into a graph.
+    /// mode=0 is hipStreamCaptureModeGlobal.
+    pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
+        let code = unsafe { (self.fn_stream_begin_capture)(stream.0, mode as c_uint) };
+        self.check(code, "hipStreamBeginCapture")
+    }
+
+    /// End capture on `stream`, returning the captured graph.
+    pub fn stream_end_capture(&self, stream: &Stream) -> HipResult<Graph> {
+        let mut graph: HipGraph = ptr::null_mut();
+        let code = unsafe { (self.fn_stream_end_capture)(stream.0, &mut graph) };
+        self.check(code, "hipStreamEndCapture")?;
+        Ok(Graph(graph))
+    }
+
+    /// Instantiate an executable graph from a captured graph.
+    pub fn graph_instantiate(&self, graph: &Graph) -> HipResult<GraphExec> {
+        let mut exec: HipGraphExec = ptr::null_mut();
+        let code = unsafe {
+            (self.fn_graph_instantiate)(&mut exec, graph.0, ptr::null_mut(), ptr::null_mut(), 0)
+        };
+        self.check(code, "hipGraphInstantiate")?;
+        Ok(GraphExec(exec))
+    }
+
+    /// Launch an executable graph on `stream`.
+    pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        let code = unsafe { (self.fn_graph_launch)(exec.0, stream.0) };
+        self.check(code, "hipGraphLaunch")
+    }
+
+    pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
+        let code = unsafe { (self.fn_graph_exec_destroy)(exec.0) };
+        std::mem::forget(exec);
+        self.check(code, "hipGraphExecDestroy")
+    }
+
+    pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
+        let code = unsafe { (self.fn_graph_destroy)(graph.0) };
+        std::mem::forget(graph);
+        self.check(code, "hipGraphDestroy")
+    }
+
+    pub fn device_synchronize(&self) -> HipResult<()> {
+        let code = unsafe { (self.fn_device_synchronize)() };
+        self.check(code, "hipDeviceSynchronize")
+    }
 }
 
 // ── Handle wrappers ─────────────────────────────────────────────
@@ -467,3 +539,11 @@ unsafe impl Send for Function {}
 /// GPU event for timing.
 pub struct Event(HipEvent);
 unsafe impl Send for Event {}
+
+/// Captured GPU operation graph.
+pub struct Graph(HipGraph);
+unsafe impl Send for Graph {}
+
+/// Executable (instantiated) graph ready for replay.
+pub struct GraphExec(HipGraphExec);
+unsafe impl Send for GraphExec {}

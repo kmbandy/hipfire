@@ -5,7 +5,7 @@ mod ffi;
 mod error;
 
 pub use error::{HipError, HipResult};
-pub use ffi::{Event, Function, HipRuntime, Module, Stream};
+pub use ffi::{Event, Function, Graph, GraphExec, HipRuntime, Module, Stream};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

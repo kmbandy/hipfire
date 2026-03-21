@@ -716,22 +716,48 @@ pub fn forward_scratch(
     top_p: f32,
     rng_state: u32,
 ) -> HipResult<(u32, u32)> {
-    let dim = config.dim;
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_dim = n_kv_heads * head_dim;
+    forward_scratch_embed(gpu, weights, config, token, pos, scratch)?;
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, scratch, temperature, top_p, rng_state)
+}
 
+/// Upload pos and compute embedding. Must be called before forward_scratch_layers.
+pub fn forward_scratch_embed(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    token: u32,
+    pos: usize,
+    scratch: &ForwardScratch,
+) -> HipResult<()> {
+    let dim = config.dim;
     // Upload pos to GPU buffer (4 bytes)
     let pos_i32 = pos as i32;
     gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-
     // Embedding lookup
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
     }
+    Ok(())
+}
+
+/// Layer loop + final norm + logits + sampling. Graph-capturable.
+pub fn forward_scratch_layers(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    temperature: f32,
+    top_p: f32,
+    rng_state: u32,
+) -> HipResult<(u32, u32)> {
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -792,11 +818,85 @@ pub fn forward_scratch(
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
-    // GPU-side sampling
+    // GPU-side sampling (includes sync readback — can't be in graph capture)
     gpu.sample_top_p(
         &scratch.logits, &scratch.sample_buf,
         config.vocab_size, temperature, top_p, rng_state,
     )
+}
+
+/// Layer loop + final norm + logits only (no sampling). Graph-capturable.
+pub fn forward_scratch_compute(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+) -> HipResult<()> {
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+
+        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
+            gpu.fused_qkv_q4k(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
+            weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
+            weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+        }
+
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(&scratch.q, qn, &scratch.q, n_heads, head_dim, config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(&scratch.k, kn, &scratch.k, n_kv_heads, head_dim, config.norm_eps)?;
+            }
+        }
+
+        gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+
+        gpu.attention_f32(
+            &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+        )?;
+
+        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+
+        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
+            gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &scratch.tmp, &scratch.gate, &scratch.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
+            weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+        }
+
+        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+    }
+
+    gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    Ok(())
 }
 
 /// Run a single forward pass for one token (decode step).

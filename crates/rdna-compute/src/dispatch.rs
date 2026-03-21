@@ -54,9 +54,16 @@ pub struct Gpu {
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
     pool: crate::pool::GpuPool,
+    /// When set, all kernel launches go to this stream instead of null stream.
+    pub active_stream: Option<hip_bridge::Stream>,
 }
 
 impl Gpu {
+    /// Returns the active stream ref for kernel launches (None = null stream).
+    fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
+        self.active_stream.as_ref()
+    }
+
     pub fn init() -> HipResult<Self> {
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;
@@ -73,6 +80,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            active_stream: None,
         })
     }
 
@@ -336,7 +344,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -377,7 +385,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -510,7 +518,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -593,7 +601,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -635,7 +643,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -676,7 +684,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -716,7 +724,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -792,7 +800,7 @@ impl Gpu {
                 [batch as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -965,7 +973,7 @@ impl Gpu {
                 [rows as u32, 1, 1],
                 [block, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -1014,7 +1022,7 @@ impl Gpu {
                 [grid, 1, 1],
                 [block, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -1064,8 +1072,11 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
 
-        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        // When a stream is active (graph capture mode), use max_seq for shared mem
+        // so the captured graph works for all sequence lengths.
+        let effective_seq = if self.active_stream.is_some() { max_seq } else { seq_len_hint };
+        let block_size = (effective_seq.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((effective_seq + block_size as usize) * 4) as u32;
 
         unsafe {
             self.hip.launch_kernel(
@@ -1073,7 +1084,7 @@ impl Gpu {
                 [n_heads as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -1111,7 +1122,7 @@ impl Gpu {
                 [grid, 1, 1],
                 [block, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -1157,7 +1168,7 @@ impl Gpu {
                 [1, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )?;
         }
@@ -1168,5 +1179,49 @@ impl Gpu {
         let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
         let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
         Ok((token_id, new_rng))
+    }
+
+    /// Launch sampling kernel only (no readback). For use during graph capture.
+    pub fn sample_top_p_launch(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
+        let func = &self.functions["sample_top_p"];
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut result_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut vs as *mut _ as *mut std::ffi::c_void,
+            &mut temp as *mut _ as *mut std::ffi::c_void,
+            &mut tp as *mut _ as *mut std::ffi::c_void,
+            &mut rng as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = (256 + 512 + 512 + 1) * 4;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
     }
 }

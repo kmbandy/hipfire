@@ -21,3 +21,4 @@ experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	descri
 19	quant_matrix	Q4K_q8embed_hfq	40.9	-	-	GARBAGE	~5200	Q4_K attn/FFN + Q8 embed/output via HFQ: Q4_K attention degrades after ~60 tok	NO
 20	phase5	baseline	33.7	-	-	PASS	~5400	Phase 5 baseline: Qwen3-8B Q4K-all HFQ, thermodynamics prompt, 856 tok	YES
 21	phase5-task1	pos_buf	36.0	-	-	PASS	~5400	All kernels use GPU pos_buf: rope, attention, kv_cache_write. 640tok thermo prompt. +6.8%	YES
+22	phase5-task2	hip_graph	-	-	-	HANG	-	HIP Graph APIs hang on gfx1010+HSA_OVERRIDE. hipStreamBeginCapture never returns. RDNA1 unsupported.	NO
