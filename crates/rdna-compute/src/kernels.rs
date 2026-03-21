@@ -363,11 +363,11 @@ extern "C" __global__ void gemv_q8_0_wide(
 
     // Assign Q8_0 blocks to warps with 4x unroll for ILP
     const int n_warps = blockDim.x / 32;
-    const int stride = n_warps * 4;
-    int bi = warp_id * 4;
-    for (; bi + 3 < blocks_per_row; bi += stride) {
+    const int stride = n_warps * 8;
+    int bi = warp_id * 8;
+    for (; bi + 7 < blocks_per_row; bi += stride) {
         #pragma unroll
-        for (int u = 0; u < 4; u++) {
+        for (int u = 0; u < 8; u++) {
             const unsigned char* block = row_data + (bi + u) * 34;
             float d = (float)*((const _Float16*)block);
             signed char qval = (signed char)block[2 + lane];
