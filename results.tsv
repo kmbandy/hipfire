@@ -26,5 +26,7 @@ experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	descri
 24	phase5-hfq4	gemv_hfq4g256	-	248.5 GB/s	55.5	PASS	-	HFQ4-G256: 18 VGPRs, 107.7us at 12288x4096. MATCHES Q4K wall-clock (107.6us). 5.6% smaller. 100% occupancy.	YES
 25	phase5-hfq4	size_sweep	-	303.7 GB/s	67.8	PASS	-	HFQ4-G256 beats Q4K at ALL sizes: 1024² 1.19x, 2048² 1.22x, 4096² 1.06x, 12288x4096 1.28x (303.7 vs 251.8 GB/s)	YES
 26	phase5-hfq4	qwen8b_e2e	41.1	-	-	GOOD	~4350	Qwen3-8B HFQ4-G256: 55.7 tok/s short, 41.1 tok/s 657tok thermo (greedy). +29% vs Q4K 31.8.	YES
-27	phase5-hfq4	qwen06b_e2e	232.2	-	-	DEGRADED	~412	Qwen3-0.6B HFQ4-G256: 232 tok/s, repetition loops. 4-bit too coarse for 0.6B. Not kernel bug.	NO
-28	phase5-hfq4	bugfix	-	-	-	-	-	Root cause: corrupt .hsaco kernel cache from killed processes. Fix: nuke cache on reboot.	YES
+27	phase5-hfq4	qwen06b_e2e	232.2	-	-	DEGRADED	~412	Qwen3-0.6B HFQ4-G256: 232 tok/s, repetition loops. G256 too coarse for 0.6B.	NO
+28	phase5-hfq4	bugfix	-	-	-	-	-	Root cause: corrupt .hsaco kernel cache from killed processes. Fix: source hash check.	YES
+29	phase5-hfq4	qwen06b_g128	155.8	-	-	GOOD	~436	Qwen3-0.6B HFQ4-G128: 220 tok/s short, 155.8 tok/s 457tok thermo. Coherent. Auto G128 for K<4096.	YES
+30	phase5-hfq4	tinyllama_g128	235.4	-	-	OK	~613	TinyLlama HFQ4-G128: 235 tok/s, completions work (no chat template). Auto G128 for K<4096.	YES
