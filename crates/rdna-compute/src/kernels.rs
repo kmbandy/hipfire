@@ -1747,6 +1747,152 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
 }
 "#;
 
+/// HFQ8 KV: FP32 scale+zero per head, contiguous uint8 data. Asymmetric quantization.
+/// Scales: [max_seq × n_kv_heads × 2] f32 (scale, zero pairs).
+/// Data: [max_seq × n_kv_heads × head_dim] uint8.
+pub const KV_CACHE_WRITE_HFQ8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_hfq8(
+    unsigned char* __restrict__ dst_data,   // [max_seq × kv_dim] uint8
+    float* __restrict__ dst_scales,         // [max_seq × n_kv_heads × 2] f32
+    const float* __restrict__ src,          // [kv_dim] FP32
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* head_src = src + h * head_dim;
+
+    // Warp min/max reduction (head_dim=128, 32 threads, 4 per thread)
+    float local_min = 1e30f, local_max = -1e30f;
+    for (int i = tid; i < head_dim; i += 32) {
+        float v = head_src[i];
+        local_min = fminf(local_min, v);
+        local_max = fmaxf(local_max, v);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_xor(local_min, offset));
+        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
+    }
+
+    float scale = (local_max - local_min) / 255.0f;
+    float zero = local_min;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Write scale+zero (lane 0)
+    if (tid == 0) {
+        dst_scales[(pos * n_kv_heads + h) * 2] = scale;
+        dst_scales[(pos * n_kv_heads + h) * 2 + 1] = zero;
+    }
+
+    // Quantize and write contiguous uint8
+    unsigned char* out = dst_data + pos * kv_dim + h * head_dim;
+    for (int i = tid; i < head_dim; i += 32) {
+        int q = __float2int_rn((head_src[i] - zero) * inv_scale);
+        q = max(0, min(255, q));
+        out[i] = (unsigned char)q;
+    }
+}
+"#;
+
+/// Attention with HFQ8 KV cache. Flat layout, FP32 scale+zero, contiguous uint8 data.
+pub const ATTENTION_HFQ8_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_hfq8_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_data,  // [max_seq × kv_dim] uint8
+    const float* __restrict__ k_scales,        // [max_seq × n_kv_heads × 2] f32
+    const unsigned char* __restrict__ v_data,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* q_head = q + h * head_dim;
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with HFQ8 dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float k_scale = k_scales[(t * n_kv_heads + kv_h) * 2];
+        float k_zero  = k_scales[(t * n_kv_heads + kv_h) * 2 + 1];
+        const unsigned char* k_head = k_data + t * kv_dim + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * (k_scale * (float)k_head[d] + k_zero);
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum with HFQ8 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            float v_scale = v_scales[(t * n_kv_heads + kv_h) * 2];
+            float v_zero  = v_scales[(t * n_kv_heads + kv_h) * 2 + 1];
+            val += scores[t] * (v_scale * (float)v_data[t * kv_dim + kv_h * head_dim + d] + v_zero);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
 /// INT8 KV with separate scale array. Contiguous int8 values, one f32 scale per head.
 /// Keys: [max_seq × n_kv_heads × head_dim] int8, Scales: [max_seq × n_kv_heads] f32.
 /// Write: one warp per head, find amax via shuffle, quantize 4 elements per thread.

@@ -669,7 +669,10 @@ pub fn prefill_forward(
             // Copy position i's K, V from batch buffers into KV cache
             gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
             gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-            if kv_cache.quant_int8 {
+            if kv_cache.quantized && !kv_cache.k_scales.is_empty() && !kv_cache.quant_int8 && !kv_cache.quant_q8 {
+                gpu.kv_cache_write_hfq8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
+                gpu.kv_cache_write_hfq8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
+            } else if kv_cache.quant_int8 {
                 gpu.kv_cache_write_int8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
                 gpu.kv_cache_write_int8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
             } else if kv_cache.quantized && kv_cache.quant_q8 {
@@ -682,7 +685,14 @@ pub fn prefill_forward(
 
             // Attention
             gpu.hip.memcpy_dtod_at(&q_slice.buf, 0, &q_batch.buf, i * q_dim * 4, q_dim * 4)?;
-            if kv_cache.quant_int8 {
+            if kv_cache.quantized && !kv_cache.k_scales.is_empty() && !kv_cache.quant_int8 && !kv_cache.quant_q8 {
+                gpu.attention_hfq8_kv(
+                    &q_slice,
+                    &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
+                    &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+                )?;
+            } else if kv_cache.quant_int8 {
                 gpu.attention_int8_kv(
                     &q_slice,
                     &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
@@ -1024,7 +1034,17 @@ pub fn forward_scratch_layers(
 
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        if kv_cache.quant_int8 {
+        if kv_cache.quantized && !kv_cache.k_scales.is_empty() && !kv_cache.quant_int8 && !kv_cache.quant_q8 {
+            // HFQ8 flat layout
+            gpu.kv_cache_write_hfq8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_hfq8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_hfq8_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
+                &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quant_int8 {
             gpu.kv_cache_write_int8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_int8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.attention_int8_kv(
@@ -1128,7 +1148,17 @@ pub fn forward_scratch_compute(
 
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        if kv_cache.quant_int8 {
+        if kv_cache.quantized && !kv_cache.k_scales.is_empty() && !kv_cache.quant_int8 && !kv_cache.quant_q8 {
+            // HFQ8 flat layout
+            gpu.kv_cache_write_hfq8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_hfq8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_hfq8_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
+                &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quant_int8 {
             gpu.kv_cache_write_int8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_int8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.attention_int8_kv(
@@ -1592,6 +1622,26 @@ impl KvCache {
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
         Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false })
+    }
+
+    /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
+    pub fn new_gpu_hfq8(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let val_elems = (max_seq_len * kv_dim + 3) / 4; // uint8 data, rounded to f32
+        let scale_elems = max_seq_len * n_kv_heads * 2; // scale + zero per head per pos
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        let mut k_scales = Vec::with_capacity(n_layers);
+        let mut v_scales = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+            v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false })
     }
 
     /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.

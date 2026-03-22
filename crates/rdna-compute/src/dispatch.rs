@@ -1540,6 +1540,55 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [total_rows, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Write KV to HFQ8 cache (FP32 scale+zero, contiguous uint8).
+    pub fn kv_cache_write_hfq8(
+        &mut self, dst_data: &GpuTensor, dst_scales: &GpuTensor, src: &GpuTensor,
+        pos_buf: &DeviceBuffer, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_hfq8", kernels::KV_CACHE_WRITE_HFQ8_SRC, "kv_cache_write_hfq8")?;
+        let func = &self.functions["kv_cache_write_hfq8"];
+        let mut dd = dst_data.buf.as_ptr(); let mut ds = dst_scales.buf.as_ptr();
+        let mut s = src.buf.as_ptr(); let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dd as *mut _ as *mut c_void, &mut ds as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void, &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with HFQ8 KV cache.
+    pub fn attention_hfq8_kv(
+        &mut self, q: &GpuTensor,
+        k_data: &GpuTensor, k_scales: &GpuTensor,
+        v_data: &GpuTensor, v_scales: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_hfq8_kv", kernels::ATTENTION_HFQ8_KV_SRC, "attention_hfq8_kv")?;
+        let func = &self.functions["attention_hfq8_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kd = k_data.buf.as_ptr(); let mut ks = k_scales.buf.as_ptr();
+        let mut vd = v_data.buf.as_ptr(); let mut vs = v_scales.buf.as_ptr();
+        let mut op = out.buf.as_ptr(); let mut pp = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void, &mut ks as *mut _ as *mut c_void,
+            &mut vd as *mut _ as *mut c_void, &mut vs as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
     /// Write KV to INT8 cache (separate scale array).
     pub fn kv_cache_write_int8(
         &mut self, dst_vals: &GpuTensor, dst_scales: &GpuTensor, src: &GpuTensor,
