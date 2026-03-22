@@ -1510,6 +1510,33 @@ impl Gpu {
         }
     }
 
+    /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch.
+    pub fn fused_gate_up_hfq4g256(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor, x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("fused_gate_up_hfq4g256", kernels::FUSED_GATE_UP_HFQ4G256_SRC, "fused_gate_up_hfq4g256")?;
+        let func = &self.functions["fused_gate_up_hfq4g256"];
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut gm = gate_m as i32;
+        let mut um = up_m as i32;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void, &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void, &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void, &mut gm as *mut _ as *mut c_void,
+            &mut um as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
+        ];
+        let total_rows = (gate_m + up_m) as u32;
+        unsafe { self.hip.launch_kernel(func, [total_rows, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// GPU-side KV cache write. Copies kv_dim floats from src to dst[pos_buf[0] * kv_dim].
     pub fn kv_cache_write(
         &mut self,
