@@ -93,6 +93,98 @@ impl Tokenizer {
         })
     }
 
+    /// Load tokenizer from HuggingFace tokenizer.json (embedded in HFQ metadata).
+    pub fn from_hf_json(json_str: &str) -> Option<Self> {
+        let tok: serde_json::Value = serde_json::from_str(json_str).ok()?;
+        let model = tok.get("model")?;
+
+        let vocab_map = model.get("vocab")?.as_object()?;
+        let vocab_size = vocab_map.len();
+
+        let mut vocab = vec![String::new(); vocab_size + 100];
+        let mut token_to_id = HashMap::with_capacity(vocab_size);
+        for (token, id_val) in vocab_map {
+            let id = id_val.as_u64()? as u32;
+            if (id as usize) >= vocab.len() {
+                vocab.resize(id as usize + 1, String::new());
+            }
+            vocab[id as usize] = token.clone();
+            token_to_id.insert(token.clone(), id);
+        }
+
+        let merges = if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
+            merges_arr.iter()
+                .filter_map(|v| {
+                    // HF tokenizer.json stores merges as either "a b" strings or ["a", "b"] arrays
+                    if let Some(s) = v.as_str() {
+                        let parts: Vec<&str> = s.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            return Some((parts[0].to_string(), parts[1].to_string()));
+                        }
+                    }
+                    if let Some(arr) = v.as_array() {
+                        if arr.len() == 2 {
+                            if let (Some(a), Some(b)) = (arr[0].as_str(), arr[1].as_str()) {
+                                return Some((a.to_string(), b.to_string()));
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut special_tokens: Vec<(String, u32)> = Vec::new();
+        if let Some(added) = tok.get("added_tokens").and_then(|v| v.as_array()) {
+            for at in added {
+                if let (Some(content), Some(id)) = (
+                    at.get("content").and_then(|v| v.as_str()),
+                    at.get("id").and_then(|v| v.as_u64()),
+                ) {
+                    let id = id as u32;
+                    if (id as usize) >= vocab.len() {
+                        vocab.resize(id as usize + 1, String::new());
+                    }
+                    vocab[id as usize] = content.to_string();
+                    token_to_id.insert(content.to_string(), id);
+                    if at.get("special").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        special_tokens.push((content.to_string(), id));
+                    }
+                }
+            }
+        }
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        let bos_id = token_to_id.get("<|endoftext|>").copied()
+            .or_else(|| token_to_id.get("<s>").copied())
+            .unwrap_or(1);
+        let eos_id = token_to_id.get("<|im_end|>").copied()
+            .or_else(|| token_to_id.get("<|endoftext|>").copied())
+            .or_else(|| token_to_id.get("</s>").copied())
+            .unwrap_or(2);
+
+        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+
+        Some(Tokenizer {
+            vocab,
+            token_to_id,
+            merges,
+            special_tokens,
+            bos_id,
+            eos_id,
+            is_gpt2_bpe,
+        })
+    }
+
+    /// Load tokenizer from HFQ metadata (extracts embedded tokenizer.json).
+    pub fn from_hfq_metadata(metadata_json: &str) -> Option<Self> {
+        let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+        let tok_str = meta.get("tokenizer")?.as_str()?;
+        Self::from_hf_json(tok_str)
+    }
+
     /// Decode a sequence of token IDs to text.
     /// Handles both GPT-2 BPE (Ġ=space, Ċ=newline) and SentencePiece (▁=space).
     pub fn decode(&self, tokens: &[u32]) -> String {

@@ -51,16 +51,10 @@ fn main() {
     eprintln!("Config: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
 
-    // Load tokenizer from a matching GGUF (fallback until tokenizer is embedded in HFQ)
-    let gguf_path = if config.arch == llama::ModelArch::Qwen3 {
-        "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf"
-    } else {
-        "/home/kaden/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-    };
-    let gguf = engine::gguf::GgufFile::open(Path::new(gguf_path)).expect("need GGUF for tokenizer");
-    let tokenizer = engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("failed to load tokenizer");
-    eprintln!("Tokenizer: {} tokens (from GGUF: {})", tokenizer.vocab_size(),
-        std::path::Path::new(gguf_path).file_name().unwrap().to_str().unwrap());
+    // Load tokenizer from HFQ metadata (embedded tokenizer.json)
+    let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .expect("no tokenizer in HFQ file — requantize with tokenizer.json in the model directory");
+    eprintln!("Tokenizer: {} tokens (from HFQ)", tokenizer.vocab_size());
 
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
 
