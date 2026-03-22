@@ -10,7 +10,7 @@
 | Metric | hipfire Before | hipfire After | llama.cpp | Ratio | Winner |
 |--------|---------------|--------------|-----------|-------|--------|
 | **8B short gen** (tok/s) | 55.5 | **55.3** | 44.3 | **1.25x** | hipfire |
-| **8B long gen** (tok/s) | 36.1 | **30.7** | 42.8 | 0.72x | llama.cpp |
+| **8B long gen** (tok/s) | 36.1 | **37.9** | 42.8 | 0.89x | llama.cpp |
 | **8B prefill** (tok/s) | 56 | **89** | 189.2 | 0.47x | llama.cpp |
 | **0.6B short gen** (tok/s) | 221 | **230.8** | 193.6 | **1.19x** | hipfire |
 | **0.6B long gen** (tok/s) | 105.9 | **~106** | 181.3 | 0.58x | llama.cpp |
