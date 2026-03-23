@@ -672,6 +672,9 @@ pub fn prefill_forward(
             if kv_cache.quant_hfq4 {
                 gpu.kv_cache_write_hfq4(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
                 gpu.kv_cache_write_hfq4(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
+            } else if kv_cache.quant_int8 {
+                gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
+                gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
             } else if kv_cache.quantized && kv_cache.quant_q8 {
                 gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
                 gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
@@ -687,18 +690,9 @@ pub fn prefill_forward(
                     &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                     &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
                 )?;
-            } else if kv_cache.quantized && kv_cache.quant_q8 {
-                gpu.attention_hfq8_kv(
-                    &q_slice,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
-                    &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
-                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-                )?;
             } else if kv_cache.quant_int8 {
-                gpu.attention_int8_kv(
-                    &q_slice,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
-                    &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+                gpu.attention_int8c_f16_kv(
+                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                     &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
                 )?;
             } else if kv_cache.quantized && kv_cache.quant_q8 {
@@ -1054,12 +1048,10 @@ pub fn forward_scratch_layers(
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
         } else if kv_cache.quant_int8 {
-            gpu.kv_cache_write_int8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_int8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_int8_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
-                &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+            gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_int8c_f16_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
         } else if kv_cache.quantized && kv_cache.quant_q8 {
@@ -1175,12 +1167,10 @@ pub fn forward_scratch_compute(
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
         } else if kv_cache.quant_int8 {
-            gpu.kv_cache_write_int8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_int8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_int8_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
-                &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+            gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_int8c_f16_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
         } else if kv_cache.quantized && kv_cache.quant_q8 {
@@ -1639,6 +1629,24 @@ impl KvCache {
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
         Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false })
+    }
+
+    /// Create INT8 co-located KV cache: [f32 scale][int8 × head_dim] = 132 bytes per head.
+    pub fn new_gpu_int8c(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bph = 4 + head_dim; // 132 for head_dim=128
+        let bpp = n_kv_heads * bph;
+        let cache_bytes = max_seq_len * bpp;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false })
     }
 
     /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
