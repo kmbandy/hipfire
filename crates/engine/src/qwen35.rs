@@ -472,9 +472,9 @@ pub fn forward(
                     1, n_v_heads, config.linear_value_head_dim,
                 )?;
 
-                // Note: llama.cpp also scales output by 1/sqrt(S_v) in the kernel
-                // but that combined with Q scaling gives 1/128 total which may be too much
-                // Testing Q-only scaling first
+                // Q-only scaling. llama.cpp also scales output by 1/sqrt(S_v)
+                // in the kernel, but that makes L00 too small (0.175 vs ref 0.501).
+                // Q-only gives L00 = 0.489 vs ref 0.501. Keeping Q-only for now.
 
                 // Gated norm: rmsnorm(attn_out) * silu(z)
                 let normed_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
