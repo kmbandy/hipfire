@@ -2433,25 +2433,41 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [1, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
-    /// Write KV vector to turbo_hfq3 quantized cache (3-bit, 52 bytes/head for hd=128).
-    pub fn kv_cache_write_turbo3(
-        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+    /// Fused KV write for turbo_hfq3: writes both K and V in one kernel launch.
+    /// 32 threads per kv_head, parallel FWHT + quantize.
+    pub fn kv_cache_write_turbo3_fused(
+        &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
         signs1: &GpuTensor, signs2: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_turbo_kernel("kv_cache_write_turbo3", kernels::KV_CACHE_WRITE_TURBO3_SRC, "kv_cache_write_turbo3")?;
         let func = &self.functions["kv_cache_write_turbo3"];
-        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut kdp = k_dst.buf.as_ptr(); let mut vdp = v_dst.buf.as_ptr();
+        let mut ksp = k_src.buf.as_ptr(); let mut vsp = v_src.buf.as_ptr();
         let mut pp = pos_buf.as_ptr();
         let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
         let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut kdp as *mut _ as *mut c_void, &mut vdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void, &mut vsp as *mut _ as *mut c_void,
             &mut pp as *mut _ as *mut c_void,
             &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [1, 1, 1], 0, self.stream_ref(), &mut params) }
+        // shared: x[head_dim] + scratch[32] = (128 + 32) * 4 = 640 bytes
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Legacy single-tensor write (calls fused with same tensor for both).
+    pub fn kv_cache_write_turbo3(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        // For backward compat: single-tensor write just uses the fused path once
+        self.kv_cache_write_turbo3_fused(dst, dst, src, src, pos_buf, signs1, signs2, n_kv_heads, head_dim)
     }
 
     /// Write KV vector to turbo_hfq2 quantized cache (2-bit, 36 bytes/head for hd=128).
@@ -2532,7 +2548,8 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
         let block_size = 32u32;
-        let shared_mem = ((seq_len_hint + 32 + head_dim) * 4) as u32;
+        // shared: scores[seq_len] + q_rotated[head_dim]
+        let shared_mem = ((seq_len_hint + head_dim) * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 
