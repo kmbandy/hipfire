@@ -2470,25 +2470,37 @@ impl Gpu {
         self.kv_cache_write_turbo3_fused(dst, dst, src, src, pos_buf, signs1, signs2, n_kv_heads, head_dim)
     }
 
-    /// Write KV vector to turbo_hfq2 quantized cache (2-bit, 36 bytes/head for hd=128).
-    pub fn kv_cache_write_turbo2(
-        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+    /// Fused K+V write for turbo_hfq2 (2-bit). 32 threads parallel FWHT.
+    pub fn kv_cache_write_turbo2_fused(
+        &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
         signs1: &GpuTensor, signs2: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_turbo_kernel("kv_cache_write_turbo2", kernels::KV_CACHE_WRITE_TURBO2_SRC, "kv_cache_write_turbo2")?;
         let func = &self.functions["kv_cache_write_turbo2"];
-        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut kdp = k_dst.buf.as_ptr(); let mut vdp = v_dst.buf.as_ptr();
+        let mut ksp = k_src.buf.as_ptr(); let mut vsp = v_src.buf.as_ptr();
         let mut pp = pos_buf.as_ptr();
         let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
         let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut kdp as *mut _ as *mut c_void, &mut vdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void, &mut vsp as *mut _ as *mut c_void,
             &mut pp as *mut _ as *mut c_void,
             &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [1, 1, 1], 0, self.stream_ref(), &mut params) }
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    pub fn kv_cache_write_turbo2(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_turbo2_fused(dst, dst, src, src, pos_buf, signs1, signs2, n_kv_heads, head_dim)
     }
 
     /// Attention with turbo_hfq4 KV cache. Includes Q pre-rotation and V output inverse-rotation.
@@ -2579,7 +2591,7 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
         let block_size = 32u32;
-        let shared_mem = ((seq_len_hint + 32 + head_dim) * 4) as u32;
+        let shared_mem = ((seq_len_hint + head_dim) * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 }

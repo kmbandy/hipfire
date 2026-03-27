@@ -1049,8 +1049,9 @@ pub fn forward_scratch_layers(
                         &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
                 }
                 2 => {
-                    gpu.kv_cache_write_turbo2(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.kv_cache_write_turbo2(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.kv_cache_write_turbo2_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
                     gpu.attention_turbo2_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
                 }
@@ -1193,8 +1194,9 @@ pub fn forward_scratch_compute(
                         &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
                 }
                 2 => {
-                    gpu.kv_cache_write_turbo2(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.kv_cache_write_turbo2(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.kv_cache_write_turbo2_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
                     gpu.attention_turbo2_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
                 }
@@ -1349,8 +1351,9 @@ pub fn forward(
                         &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
                 }
                 2 => {
-                    gpu.kv_cache_write_turbo2(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.kv_cache_write_turbo2(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.kv_cache_write_turbo2_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &k, &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
                     gpu.attention_turbo2_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
                 }
