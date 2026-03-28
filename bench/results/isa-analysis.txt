@@ -1,0 +1,19 @@
+ISA Analysis — gfx1010 kernel VGPRs (2026-03-28)
+
+GEMV kernels:
+  gemv_hfq4g256:      18 VGPRs, 0 spills, 15 FMAs, 6 v_bfe + 2 shift/mask
+  gemv_hfq4g256_wide: (2-row variant, used for M>=64)
+
+Attention kernels:
+  attention_q8_0_kv:   39 VGPRs, 0 spills
+  attention_turbo2_kv: 32 VGPRs, 0 spills (__shfl_xor FWHT)
+  attention_turbo4_kv: (pending check)
+
+KV write kernels:
+  kv_cache_write_turbo2: (pending check)
+
+Notes:
+- HFQ4 GEMV: compiler auto-emits v_bfe_u32 for nibble extraction. No manual optimization needed.
+- turbo2 attention has FEWER VGPRs than Q8 attention (32 vs 39)!
+  This means turbo2 has better occupancy at high CU pressure.
+- The __shfl_xor FWHT saves VGPRs vs shared-memory FWHT (no LDS address regs needed)
