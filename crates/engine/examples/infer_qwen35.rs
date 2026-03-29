@@ -114,14 +114,18 @@ fn main() {
         logits.iter().cloned().fold(f32::INFINITY, f32::min),
         logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
 
-    // Generate
-    let max_gen = 128;
+    // Generate with repeat penalty (same as infer_hfq)
+    let max_gen = 256;
+    let repeat_penalty: f32 = 1.1;
+    let repeat_window: usize = 64;
     let t2 = Instant::now();
-    let mut next_token = engine::llama::argmax(&logits);
+    let mut token_history: Vec<u32> = prompt_tokens.clone();
+    let mut next_token = engine::llama::sample_top_p(&logits, 0.6, 0.8);
     let mut generated = Vec::new();
 
     for gi in 0..max_gen {
         generated.push(next_token);
+        token_history.push(next_token);
         let text = tokenizer.decode(&[next_token]);
         print!("{text}");
         std::io::stdout().flush().ok();
@@ -132,7 +136,19 @@ fn main() {
         let pos = prompt_tokens.len() + generated.len() - 1;
         logits = qwen35::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state)
             .expect("forward failed");
-        next_token = engine::llama::argmax(&logits);
+
+        // Apply repeat penalty
+        let hist_start = token_history.len().saturating_sub(repeat_window);
+        for &t in &token_history[hist_start..] {
+            if (t as usize) < logits.len() {
+                if logits[t as usize] > 0.0 {
+                    logits[t as usize] /= repeat_penalty;
+                } else {
+                    logits[t as usize] *= repeat_penalty;
+                }
+            }
+        }
+        next_token = engine::llama::sample_top_p(&logits, 0.6, 0.8);
     }
 
     let gen_ms = t2.elapsed().as_millis();
