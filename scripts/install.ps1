@@ -1,0 +1,335 @@
+# hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
+# Usage: irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.ps1 | iex
+$ErrorActionPreference = "Stop"
+
+# ─── Paths ───────────────────────────────────────────────
+$HipfireDir  = "$env:USERPROFILE\.hipfire"
+$BinDir      = "$HipfireDir\bin"
+$RuntimeDir  = "$HipfireDir\runtime"
+$ModelsDir   = "$HipfireDir\models"
+$SrcDir      = "$HipfireDir\src"
+
+# ─── Constants ───────────────────────────────────────────
+$GithubRepo   = "Kaden-Schutt/hipfire"
+$GithubBranch = "alpha-builds"
+
+Write-Host "=== hipfire installer ===" -ForegroundColor Cyan
+Write-Host ""
+
+# ─── GPU Detection ───────────────────────────────────────
+Write-Host "Checking for AMD GPU..." -ForegroundColor Cyan
+
+$GpuArch = "unknown"
+try {
+    $VideoControllers = Get-CimInstance Win32_VideoController -ErrorAction Stop
+    $AmdGpu = $VideoControllers | Where-Object { $_.Name -match "AMD|Radeon" } | Select-Object -First 1
+    if ($AmdGpu) {
+        $GpuName = $AmdGpu.Name
+        Write-Host "  Found: $GpuName"
+
+        # Map GPU name to arch
+        if ($GpuName -match "5700|RX 5[0-9]{3}") {
+            $GpuArch = "gfx1010"
+        } elseif ($GpuName -match "6[89]00|6[79]50|6[89]50|RX 6[0-9]{3}") {
+            $GpuArch = "gfx1030"
+        } elseif ($GpuName -match "7900|7800|7700|7600|RX 7[0-9]{3}") {
+            $GpuArch = "gfx1100"
+        } elseif ($GpuName -match "9070|9060|RX 9[0-9]{3}") {
+            $GpuArch = "gfx1200"
+        }
+    } else {
+        Write-Host "  WARNING: No AMD/Radeon GPU found in Win32_VideoController." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  WARNING: Could not query GPU information: $_" -ForegroundColor Yellow
+}
+
+if ($GpuArch -eq "unknown") {
+    Write-Host "  WARNING: Could not detect GPU architecture." -ForegroundColor Yellow
+    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9070)"
+    $GpuArch = Read-Host "  Enter your GPU arch [or Enter to skip]"
+    if ([string]::IsNullOrWhiteSpace($GpuArch)) { $GpuArch = "unknown" }
+}
+Write-Host "  GPU arch: $GpuArch" -ForegroundColor Green
+
+# ─── Create directories ──────────────────────────────────
+Write-Host ""
+Write-Host "Creating directories..." -ForegroundColor Cyan
+New-Item -ItemType Directory -Force -Path $BinDir    | Out-Null
+New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+New-Item -ItemType Directory -Force -Path $ModelsDir  | Out-Null
+Write-Host "  $BinDir" -ForegroundColor Green
+Write-Host "  $RuntimeDir" -ForegroundColor Green
+Write-Host "  $ModelsDir" -ForegroundColor Green
+
+# ─── HIP DLL (amdhip64.dll) ──────────────────────────────
+Write-Host ""
+Write-Host "Checking HIP runtime (amdhip64.dll)..." -ForegroundColor Cyan
+
+$HipDllFound = $false
+$HipDllDest  = "$RuntimeDir\amdhip64.dll"
+
+# Check RuntimeDir first (idempotent re-runs)
+if (Test-Path $HipDllDest) {
+    Write-Host "  amdhip64.dll: found in RuntimeDir ✓" -ForegroundColor Green
+    $HipDllFound = $true
+}
+
+# Check %HIP_PATH%\bin
+if (-not $HipDllFound -and $env:HIP_PATH) {
+    $candidate = Join-Path $env:HIP_PATH "bin\amdhip64.dll"
+    if (Test-Path $candidate) {
+        Write-Host "  amdhip64.dll: found at $candidate ✓" -ForegroundColor Green
+        Copy-Item $candidate $HipDllDest -Force
+        $HipDllFound = $true
+    }
+}
+
+# Check standard ROCm install location
+if (-not $HipDllFound) {
+    $candidate = "C:\Program Files\AMD\ROCm\bin\amdhip64.dll"
+    if (Test-Path $candidate) {
+        Write-Host "  amdhip64.dll: found at $candidate ✓" -ForegroundColor Green
+        Copy-Item $candidate $HipDllDest -Force
+        $HipDllFound = $true
+    }
+}
+
+# Attempt download from GitHub release
+if (-not $HipDllFound) {
+    Write-Host "  amdhip64.dll: not found locally. Downloading from GitHub release..." -ForegroundColor Yellow
+    $DllUrl = "https://github.com/$GithubRepo/releases/download/hip-runtime/amdhip64.dll"
+    try {
+        Invoke-WebRequest -Uri $DllUrl -OutFile $HipDllDest -UseBasicParsing
+        Write-Host "  amdhip64.dll: downloaded ✓" -ForegroundColor Green
+        $HipDllFound = $true
+    } catch {
+        Write-Host "  amdhip64.dll: download failed: $_" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  hipfire needs amdhip64.dll to run. Install ROCm for Windows manually:" -ForegroundColor Yellow
+        Write-Host "    https://rocm.docs.amd.com/en/latest/deploy/windows/quick_start.html"
+        Write-Host "  Or place amdhip64.dll in: $RuntimeDir"
+        Write-Host ""
+        $reply = Read-Host "  Continue without HIP runtime? [y/N]"
+        if ($reply -notmatch "^[Yy]$") {
+            Write-Host "Exiting. Re-run after installing ROCm." -ForegroundColor Red
+            exit 1
+        }
+    }
+}
+
+# Ensure runtime dir is in PATH for this session so daemon can find the DLL
+if ($HipDllFound) {
+    $env:PATH = "$RuntimeDir;$env:PATH"
+}
+
+# ─── Bun (CLI runtime) ───────────────────────────────────
+Write-Host ""
+Write-Host "Checking Bun..." -ForegroundColor Cyan
+
+$BunBin = "$env:USERPROFILE\.bun\bin"
+if (Get-Command bun -ErrorAction SilentlyContinue) {
+    Write-Host "  Bun: found ✓" -ForegroundColor Green
+} else {
+    Write-Host "  Bun not found. Installing..." -ForegroundColor Yellow
+    try {
+        powershell -c "irm bun.sh/install.ps1 | iex"
+        # Add bun to PATH for remainder of this session
+        $env:PATH = "$BunBin;$env:PATH"
+        if (Get-Command bun -ErrorAction SilentlyContinue) {
+            Write-Host "  Bun installed ✓" -ForegroundColor Green
+        } else {
+            Write-Host "  Bun installed but not in PATH. Add manually:" -ForegroundColor Yellow
+            Write-Host "    $BunBin"
+        }
+    } catch {
+        Write-Host "  Bun install failed: $_" -ForegroundColor Red
+        Write-Host "  Visit https://bun.sh and install manually, then re-run."
+        exit 1
+    }
+}
+
+# ─── Clone / update repo ─────────────────────────────────
+Write-Host ""
+Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
+
+if (-not (Test-Path "$SrcDir\.git")) {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Host "  ERROR: git is required. Install from https://git-scm.com and re-run." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  Cloning https://github.com/$GithubRepo.git ..."
+    try {
+        git clone --depth 1 --branch $GithubBranch "https://github.com/$GithubRepo.git" $SrcDir
+        Write-Host "  Cloned ✓" -ForegroundColor Green
+    } catch {
+        Write-Host "  Clone failed: $_" -ForegroundColor Red
+        Write-Host "  Try manually: git clone https://github.com/$GithubRepo.git $SrcDir"
+        exit 1
+    }
+} else {
+    Write-Host "  Existing clone found at $SrcDir"
+    $status = & git -C $SrcDir status --porcelain 2>$null
+    if ($status) {
+        Write-Host "  WARNING: local modifications detected." -ForegroundColor Yellow
+        $reply = Read-Host "  Overwrite local changes and update? [y/N]"
+        if ($reply -match "^[Yy]$") {
+            git -C $SrcDir fetch origin $GithubBranch --depth 1 2>$null
+            git -C $SrcDir reset --hard "origin/$GithubBranch" 2>$null
+            Write-Host "  Updated ✓" -ForegroundColor Green
+        } else {
+            Write-Host "  Keeping existing checkout." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  Updating..."
+        git -C $SrcDir fetch origin $GithubBranch --depth 1 2>$null
+        git -C $SrcDir pull --ff-only origin $GithubBranch 2>$null
+        Write-Host "  Updated ✓" -ForegroundColor Green
+    }
+}
+
+$RepoDir = $SrcDir
+
+# ─── Build / install binaries ────────────────────────────
+Write-Host ""
+Write-Host "Installing hipfire binaries..." -ForegroundColor Cyan
+
+# Look for pre-built daemon.exe
+$PreBuilt = @(
+    "$RepoDir\target\release\examples\daemon.exe",
+    "$RepoDir\bin\daemon.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ($PreBuilt) {
+    Write-Host "  Pre-built daemon.exe found: $PreBuilt ✓" -ForegroundColor Green
+    Copy-Item $PreBuilt "$BinDir\daemon.exe" -Force
+} else {
+    Write-Host "  No pre-built binaries. Building from source..." -ForegroundColor Yellow
+
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Write-Host "  Installing Rust via rustup..." -ForegroundColor Yellow
+        $RustupUrl  = "https://win.rustup.rs/x86_64"
+        $RustupExe  = "$env:TEMP\rustup-init.exe"
+        Invoke-WebRequest -Uri $RustupUrl -OutFile $RustupExe -UseBasicParsing
+        & $RustupExe -y --default-toolchain stable
+        # Add cargo to PATH for this session
+        $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+    }
+
+    Write-Host "  cargo build --release (this may take several minutes)..."
+    Push-Location $RepoDir
+    try {
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine
+    } finally {
+        Pop-Location
+    }
+
+    $BuiltExe = "$RepoDir\target\release\examples\daemon.exe"
+    if (-not (Test-Path $BuiltExe)) {
+        Write-Host ""
+        Write-Host "  BUILD FAILED." -ForegroundColor Red
+        Write-Host "  Common causes:"
+        Write-Host "    - Missing ROCm SDK (needed to compile)"
+        Write-Host "    - Missing Visual C++ build tools"
+        Write-Host ""
+        Write-Host "  After fixing, re-run this installer or build manually:"
+        Write-Host "    cd $RepoDir"
+        Write-Host "    cargo build --release --features deltanet --example daemon -p engine"
+        exit 1
+    }
+    Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force
+    Write-Host "  Build complete ✓" -ForegroundColor Green
+}
+
+# Copy optional helper binaries if present
+foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
+    $src = "$RepoDir\target\release\examples\$exe"
+    if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
+}
+
+# ─── CLI ─────────────────────────────────────────────────
+Write-Host ""
+Write-Host "Installing CLI..." -ForegroundColor Cyan
+
+$CliDir = "$HipfireDir\cli"
+New-Item -ItemType Directory -Force -Path $CliDir | Out-Null
+Copy-Item "$RepoDir\cli\index.ts"    "$CliDir\index.ts"    -Force
+Copy-Item "$RepoDir\cli\package.json" "$CliDir\package.json" -Force
+
+# Create hipfire.cmd wrapper
+$CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"
+[System.IO.File]::WriteAllText("$BinDir\hipfire.cmd", $CmdWrapper)
+
+Write-Host "  CLI installed to $CliDir ✓" -ForegroundColor Green
+Write-Host "  Wrapper: $BinDir\hipfire.cmd ✓" -ForegroundColor Green
+
+# ─── Kernels ─────────────────────────────────────────────
+Write-Host ""
+if ($GpuArch -ne "unknown") {
+    Write-Host "Setting up kernels for $GpuArch..." -ForegroundColor Cyan
+    $KernelSrc  = "$RepoDir\kernels\compiled\$GpuArch"
+    $KernelDest = "$BinDir\kernels\compiled\$GpuArch"
+    New-Item -ItemType Directory -Force -Path $KernelDest | Out-Null
+
+    if (Test-Path $KernelSrc) {
+        $Hsacos = Get-ChildItem "$KernelSrc\*.hsaco" -ErrorAction SilentlyContinue
+        if ($Hsacos.Count -gt 0) {
+            Copy-Item "$KernelSrc\*.hsaco" $KernelDest -Force
+            Write-Host "  Copied $($Hsacos.Count) kernels to $KernelDest ✓" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: No .hsaco files found in $KernelSrc" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  WARNING: No pre-compiled kernels for $GpuArch in repo." -ForegroundColor Yellow
+        Write-Host "  Compile them: cd $RepoDir && scripts\compile-kernels.ps1 $GpuArch"
+        Write-Host "  Then copy: Copy-Item kernels\compiled\$GpuArch\*.hsaco $KernelDest"
+    }
+} else {
+    Write-Host "Skipping kernel setup (GPU arch unknown)." -ForegroundColor Yellow
+    Write-Host "  Re-run installer after fixing GPU detection, or copy kernels manually."
+}
+
+# ─── Config ──────────────────────────────────────────────
+$ConfigFile = "$HipfireDir\config.json"
+if (-not (Test-Path $ConfigFile)) {
+    $Config = [ordered]@{
+        temperature = 0.3
+        top_p       = 0.8
+        max_tokens  = 512
+        gpu_arch    = $GpuArch
+    } | ConvertTo-Json
+    [System.IO.File]::WriteAllText($ConfigFile, $Config)
+    Write-Host ""
+    Write-Host "Config written: $ConfigFile" -ForegroundColor Green
+}
+
+# ─── PATH ────────────────────────────────────────────────
+Write-Host ""
+$CurrentUserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+if ($CurrentUserPath -notlike "*$BinDir*") {
+    Write-Host "hipfire bin dir is not in your user PATH." -ForegroundColor Yellow
+    Write-Host "  $BinDir"
+    $reply = Read-Host "Add to user PATH permanently? [Y/n]"
+    if ($reply -notmatch "^[Nn]$") {
+        $NewPath = "$BinDir;$CurrentUserPath"
+        [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+        $env:PATH = "$BinDir;$env:PATH"
+        Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+    } else {
+        Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "hipfire already in PATH ✓" -ForegroundColor Green
+}
+
+# ─── Quick start ─────────────────────────────────────────
+Write-Host ""
+Write-Host "=== hipfire installed ===" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Quick start:" -ForegroundColor Green
+Write-Host "  hipfire list                        # see local models"
+Write-Host "  hipfire run <model.hfq> `"Hello`"    # generate text"
+Write-Host "  hipfire serve                       # start OpenAI-compatible API"
+Write-Host ""
+Write-Host "Models go in $ModelsDir"
+Write-Host ""
