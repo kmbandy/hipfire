@@ -80,7 +80,19 @@ impl Gpu {
 
         let arch = hip.get_arch(0).unwrap_or_else(|_| "gfx1010".to_string());
         let (vram_free, vram_total) = hip.get_vram_info().unwrap_or((0, 0));
-        eprintln!("GPU: {} ({:.1} GB VRAM)", arch, vram_total as f64 / 1e9);
+
+        // Check HIP runtime version matches GPU arch requirements
+        let (hip_major, hip_minor) = hip.runtime_version().unwrap_or((0, 0));
+        let (min_major, min_minor) = match arch.as_str() {
+            "gfx1200" | "gfx1201" => (6, 4), // RDNA4 needs ROCm 6.4+
+            "gfx1100" | "gfx1101" | "gfx1102" => (5, 5), // RDNA3 needs ROCm 5.5+
+            _ => (5, 0),
+        };
+        if hip_major > 0 && (hip_major < min_major || (hip_major == min_major && hip_minor < min_minor)) {
+            eprintln!("WARNING: HIP runtime {}.{} may not support {}. Minimum: {}.{}", hip_major, hip_minor, arch, min_major, min_minor);
+            eprintln!("  Update your HIP runtime or kernels may fail to load.");
+        }
+        eprintln!("GPU: {} ({:.1} GB VRAM, HIP {}.{})", arch, vram_total as f64 / 1e9, hip_major, hip_minor);
 
         let compiler = KernelCompiler::new(&arch)?;
 

@@ -21,6 +21,9 @@ const HIP_SUCCESS: u32 = 0;
 pub struct HipRuntime {
     _lib: Library,
 
+    // Version
+    fn_runtime_get_version: unsafe extern "C" fn(*mut c_int) -> u32,
+
     // Device management
     fn_get_device_count: unsafe extern "C" fn(*mut c_int) -> u32,
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
@@ -134,6 +137,7 @@ impl HipRuntime {
 
         unsafe {
             Ok(Self {
+                fn_runtime_get_version: load_fn!(lib, "hipRuntimeGetVersion", unsafe extern "C" fn(*mut c_int) -> u32),
                 fn_get_device_count: load_fn!(lib, "hipGetDeviceCount", unsafe extern "C" fn(*mut c_int) -> u32),
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
                 fn_malloc: load_fn!(lib, "hipMalloc", unsafe extern "C" fn(*mut *mut c_void, usize) -> u32),
@@ -179,6 +183,19 @@ impl HipRuntime {
                 Some(&self.fn_get_error_string),
             ))
         }
+    }
+
+    // ── Version ────────────────────────────────────────────────
+
+    /// Get HIP runtime version as (major, minor). E.g. ROCm 6.3 → (6, 3).
+    pub fn runtime_version(&self) -> HipResult<(i32, i32)> {
+        let mut version: c_int = 0;
+        let code = unsafe { (self.fn_runtime_get_version)(&mut version) };
+        self.check(code, "hipRuntimeGetVersion")?;
+        // HIP version encoding: major * 10000000 + minor * 100000 + patch
+        let major = version / 10_000_000;
+        let minor = (version % 10_000_000) / 100_000;
+        Ok((major, minor))
     }
 
     // ── Device management ───────────────────────────────────────
