@@ -171,22 +171,31 @@ if (-not (Test-Path "$SrcDir\.git")) {
     }
 } else {
     Write-Host "  Existing clone found at $SrcDir"
-    $status = & git -C $SrcDir status --porcelain 2>$null
-    if ($status) {
+    $status = & git -C $SrcDir status --porcelain 2>&1 | Out-String
+    if ($status.Trim()) {
         Write-Host "  WARNING: local modifications detected." -ForegroundColor Yellow
         $reply = Read-Host "  Overwrite local changes and update? [y/N]"
         if ($reply -match "^[Yy]$") {
-            git -C $SrcDir fetch origin $GithubBranch --depth 1 2>$null
-            git -C $SrcDir reset --hard "origin/$GithubBranch" 2>$null
-            Write-Host "  Updated ✓" -ForegroundColor Green
+            try {
+                & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
+                & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
+                Write-Host "  Updated ✓" -ForegroundColor Green
+            } catch {
+                Write-Host "  Update failed (non-fatal)." -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  Keeping existing checkout." -ForegroundColor Yellow
         }
     } else {
         Write-Host "  Updating..."
-        git -C $SrcDir fetch origin $GithubBranch --depth 1 2>$null
-        git -C $SrcDir pull --ff-only origin $GithubBranch 2>$null
-        Write-Host "  Updated ✓" -ForegroundColor Green
+        try {
+            $env:GIT_TERMINAL_PROMPT = "0"
+            & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
+            & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
+            Write-Host "  Updated ✓" -ForegroundColor Green
+        } catch {
+            Write-Host "  Update failed (non-fatal). Using existing checkout." -ForegroundColor Yellow
+        }
     }
 }
 
