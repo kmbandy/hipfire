@@ -183,6 +183,18 @@ pub trait Transport: Send {
         gpu: &mut Gpu,
     ) -> HipResult<()>;
 
+    /// Read `len` bytes from `hfq_offset` directly into the caller's
+    /// host slice (typically pinned via `hipHostMalloc`). No GPU work —
+    /// the WeightPager v0.3 host tier uses this to populate pinned-RAM
+    /// shadows of paged weights without allocating a device buffer.
+    /// Caller guarantees `dst.len() == len`.
+    fn read_to_host(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> HipResult<()>;
+
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
     fn wait(&mut self, handles: &[TransferHandle]) -> HipResult<()>;
@@ -326,6 +338,38 @@ impl Transport for PreadH2DTransport {
         gpu.hip.memcpy_htod(&dst.buf, &self.staging[..len])
     }
 
+    fn read_to_host(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> HipResult<()> {
+        // pread directly into the caller's slice — no staging, no GPU. The
+        // dst slice typically backs a `hipHostMalloc`-pinned `HostBuffer`,
+        // so this single read populates the host tier and primes future
+        // promotions to fast PCIe copies.
+        debug_assert_eq!(dst.len(), len);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(dst, hfq_offset as u64)
+                .map_err(|e| hip_bridge::HipError::new(0, &format!(
+                    "pread {} bytes at offset {} (read_to_host): {}",
+                    len, hfq_offset, e
+                )))
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            self.file.seek(SeekFrom::Start(hfq_offset as u64))
+                .and_then(|_| self.file.read_exact(dst))
+                .map_err(|e| hip_bridge::HipError::new(0, &format!(
+                    "pread {} bytes at offset {} (read_to_host): {}",
+                    len, hfq_offset, e
+                )))
+        }
+    }
+
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         // Transfers complete synchronously inside `fetch`/`fill_into` in v0.1.
         Ok(())
@@ -345,6 +389,16 @@ pub struct PagerConfig {
     /// `u64::MAX` means "unlimited" (effectively disables eviction — useful
     /// for testing the routing path without VRAM pressure).
     pub vram_budget_bytes: u64,
+    /// Soft cap on **pinned host RAM** bytes the pager may hold (v0.3 host
+    /// tier). When > 0, weights cold-loaded from disk are also cached in
+    /// pinned host memory; subsequent VRAM promotions copy host→device at
+    /// PCIe bandwidth (~25 GB/s pinned vs ~5 GB/s pageable / NVMe). For
+    /// the canonical "27B fits in RAM, partially in VRAM" use case, set
+    /// this above the model's paged-weight footprint so the host tier
+    /// never evicts and every page-in is a fast PCIe copy. `0` (default)
+    /// disables the tier — behavior identical to v0.2 (every cold load
+    /// re-reads from NVMe).
+    pub host_budget_bytes: u64,
     /// If true, the pager prints structured residency events to stderr.
     /// Disabled by default; useful when debugging eviction policy.
     pub trace: bool,
@@ -354,6 +408,7 @@ impl Default for PagerConfig {
     fn default() -> Self {
         Self {
             vram_budget_bytes: u64::MAX,
+            host_budget_bytes: 0,
             trace: false,
         }
     }
@@ -380,6 +435,31 @@ pub struct WeightPager {
     lru: VecDeque<WeightId>,
     /// Bytes currently held by `resident`.
     vram_used_bytes: u64,
+    /// **Host (pinned-RAM) tier** (v0.3). Independent of `resident` — a
+    /// weight may be only here, only in `resident`, in both (shadow), or
+    /// neither (cold). When a vram-resident weight gets evicted, its host
+    /// shadow stays so the next promotion is a cheap PCIe copy rather
+    /// than another NVMe read. Empty when `config.host_budget_bytes == 0`.
+    host_resident: HashMap<WeightId, HostResident>,
+    /// One big shared arena for every host-resident weight. Allocated
+    /// lazily on first prefetch — sized to `config.host_budget_bytes`.
+    /// A contiguous bump arena is correct because v0.3-α only supports
+    /// the "host budget ≥ total paged weights" regime (no eviction;
+    /// warmup → permanent residency).
+    ///
+    /// **Unpinned** today (plain `Vec<u8>`) — pinned (`hipHostMalloc`)
+    /// would unlock ~5× faster H2D copies (~25 GB/s vs ~5 GB/s on
+    /// PCIe 4.0) but requires `RLIMIT_MEMLOCK` to be raised above the
+    /// 8 MB Linux default, which most users haven't done. The host
+    /// tier still wins because it skips the NVMe re-read on every
+    /// page-in; pinned is the v0.3-β polish on top of that.
+    host_arena: Option<Vec<u8>>,
+    /// LRU queue for the host tier — kept for forward compatibility
+    /// with v0.3-β eviction, but not consulted today.
+    host_lru: VecDeque<WeightId>,
+    /// Bytes currently held by `host_resident`. Doubles as the
+    /// bump-arena cursor: next allocation lands at `host_arena[host_used_bytes..]`.
+    host_used_bytes: u64,
     /// Per-weight (file_offset, byte_len) for cold-load via Transport.
     /// Populated at registration time when the model loader walks the HFQ
     /// tensor index. Stable across the run.
@@ -429,12 +509,33 @@ struct Resident {
     bytes: u64,
 }
 
+/// A pinned-host (page-locked) shadow copy of a paged weight. Backs the
+/// v0.3 host tier — when a `WeightId` has a `HostResident`, promoting
+/// it to VRAM is a single PCIe-bandwidth memcpy rather than an NVMe
+/// read. Stores an offset into `WeightPager::host_arena` rather than
+/// owning its own pinned buffer; the arena is one big `hipHostMalloc`
+/// shared across all weights, so per-entry residency is just a 16-byte
+/// record. Page-locking ~9 GB takes ~300 ms once at warmup vs. ~64 s
+/// across 192 small allocs.
+struct HostResident {
+    /// Byte offset into the pager's `host_arena`.
+    offset: usize,
+    /// On-disk length of this weight (equal to the pread size). Stored
+    /// alongside `offset` so the host→device memcpy can size the
+    /// transfer without re-consulting the catalog.
+    bytes: u64,
+}
+
 impl WeightPager {
     pub fn new(transport: Box<dyn Transport>, config: PagerConfig) -> Self {
         Self {
             resident: HashMap::new(),
             lru: VecDeque::new(),
             vram_used_bytes: 0,
+            host_resident: HashMap::new(),
+            host_arena: None,
+            host_lru: VecDeque::new(),
+            host_used_bytes: 0,
             catalog: HashMap::new(),
             transport,
             config,
@@ -468,12 +569,19 @@ impl WeightPager {
 
     /// Ensure `id` is in VRAM. Synchronous.
     ///
-    /// Behavior:
-    /// - Already resident → mark recently-used, return Ok.
-    /// - Not registered (loader bug) → `NotRegistered` error, no GPU work.
-    /// - Cold (registered but not resident) → if adding `id` would exceed
-    ///   `config.vram_budget_bytes`, evict LRU residents until enough room.
-    ///   Then fetch via transport, populate, track residency.
+    /// Three paths, in priority order:
+    /// 1. **VRAM hit** — already resident → touch LRU, done.
+    /// 2. **Host hit** (v0.3) — pinned host shadow exists → memcpy
+    ///    host→device at full PCIe bandwidth (~25 GB/s), no NVMe touch.
+    /// 3. **Cold** — read from disk. When `host_budget_bytes > 0`,
+    ///    routes the cold load through a freshly-allocated pinned host
+    ///    buffer and stashes it in the host tier (so the next eviction
+    ///    + re-promotion is a fast PCIe copy). When the host budget is
+    ///    `0`, falls back to the v0.2 path (transport.fetch via
+    ///    unpinned staging — same semantics as before).
+    ///
+    /// Errors: `NotRegistered` if `id` was never `register`'d (loader
+    /// bug). `BudgetExhausted` if eviction couldn't free enough room.
     pub fn ensure_resident(
         &mut self,
         id: WeightId,
@@ -488,26 +596,207 @@ impl WeightPager {
             .get(&id)
             .ok_or(WeightPagerError::NotRegistered(id))?;
         let need = range.len as u64;
-        // Evict if cold-loading `id` would exceed budget. Skip when budget is
-        // u64::MAX (the unlimited / testing default — saves the LRU walk).
+        // Evict from VRAM tier if cold-loading would exceed budget.
+        // u64::MAX = unlimited (skip the LRU walk).
         if self.config.vram_budget_bytes != u64::MAX
             && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
         {
             self.evict_lru_until(need, gpu)?;
         }
-        let (tensor, _handle) = self.transport.fetch(range.offset, range.len, gpu)?;
+
+        let host_hit = self.host_resident.contains_key(&id)
+            || self.try_cold_load_into_host(id, range, gpu)?;
+        let tensor = if host_hit {
+            let t = {
+                let h = self.host_resident.get(&id).unwrap();
+                let arena = self.host_arena.as_ref().expect(
+                    "host_resident populated without host_arena — pager invariant",
+                );
+                gpu.upload_raw(&arena[h.offset..h.offset + h.bytes as usize], &[range.len])?
+            };
+            self.touch_host_lru(id);
+            if self.config.trace {
+                eprintln!(
+                    "[weight_pager] promote-host->vram {id:?} ({} bytes)",
+                    range.len
+                );
+            }
+            t
+        } else {
+            // Host tier disabled or arena full — v0.2 path.
+            let (t, _handle) = self.transport.fetch(range.offset, range.len, gpu)?;
+            if self.config.trace {
+                eprintln!(
+                    "[weight_pager] cold-load (no host) {id:?} ({} bytes)",
+                    range.len
+                );
+            }
+            t
+        };
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         self.resident.insert(id, Resident { tensor, bytes: need });
         self.lru.push_back(id);
+        Ok(())
+    }
+
+    /// Populate the pinned-host tier for `id` without touching the GPU.
+    /// Used at warmup to pre-fill the host cache so first-touch
+    /// promotions to VRAM are PCIe-bound, not NVMe-bound. No-op if the
+    /// host tier is disabled (`host_budget_bytes == 0`) or `id` is
+    /// already host-resident.
+    pub fn prefetch_to_host(
+        &mut self,
+        id: WeightId,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        if self.config.host_budget_bytes == 0 {
+            return Ok(()); // tier disabled
+        }
+        if self.host_resident.contains_key(&id) {
+            self.touch_host_lru(id);
+            return Ok(());
+        }
+        let range = *self
+            .catalog
+            .get(&id)
+            .ok_or(WeightPagerError::NotRegistered(id))?;
+        self.try_cold_load_into_host(id, range, gpu)?;
+        Ok(())
+    }
+
+    /// Allocate the host arena (lazy, on first prefetch). Sized to
+    /// `config.host_budget_bytes`. Plain heap memory — see the field
+    /// comment for why we don't pin in v0.3-α.
+    fn ensure_host_arena(&mut self, _gpu: &mut Gpu) -> Result<(), WeightPagerError> {
+        if self.host_arena.is_some() {
+            return Ok(());
+        }
+        let budget = self.config.host_budget_bytes as usize;
+        if budget == 0 {
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        let buf = vec![0u8; budget];
         if self.config.trace {
             eprintln!(
-                "[weight_pager] cold-load {id:?} ({} bytes) — {} resident, {} bytes used",
-                range.len,
-                self.resident.len(),
-                self.vram_used_bytes
+                "[weight_pager] host arena: allocated {} MB unpinned in {:.2}s",
+                budget / (1024 * 1024),
+                t0.elapsed().as_secs_f32(),
             );
         }
+        self.host_arena = Some(buf);
         Ok(())
+    }
+
+    /// **Opportunistic** host-tier population: read `range` from disk
+    /// into the next free slot in the host arena and record residency.
+    /// Returns `Ok(true)` if the weight got cached, `Ok(false)` if the
+    /// arena was full (caller falls back to disk on every page-in for
+    /// this weight). Pure no-op when the host tier is disabled.
+    ///
+    /// "Opportunistic" rather than "must-fit" because the bump arena
+    /// has no eviction in v0.3-α — once full, new weights bypass the
+    /// host tier entirely. Lets the user set `host_budget_bytes` below
+    /// the catalog total without crashing the forward pass.
+    fn try_cold_load_into_host(
+        &mut self,
+        id: WeightId,
+        range: ByteRange,
+        gpu: &mut Gpu,
+    ) -> Result<bool, WeightPagerError> {
+        if self.config.host_budget_bytes == 0 {
+            return Ok(false);
+        }
+        let need = range.len as u64;
+        if self.host_used_bytes.saturating_add(need) > self.config.host_budget_bytes {
+            return Ok(false); // arena full — caller falls back to v0.2 path
+        }
+        self.ensure_host_arena(gpu)?;
+        let offset = self.host_used_bytes as usize;
+        {
+            let arena = self.host_arena.as_mut().unwrap();
+            self.transport.read_to_host(
+                range.offset,
+                range.len,
+                &mut arena[offset..offset + range.len],
+            )?;
+        }
+        self.host_used_bytes = self.host_used_bytes.saturating_add(need);
+        self.host_resident.insert(id, HostResident { offset, bytes: need });
+        self.host_lru.push_back(id);
+        if self.config.trace {
+            eprintln!(
+                "[weight_pager] host-load {id:?} ({} bytes) @ off {} — {}MB used / {} entries",
+                range.len,
+                offset,
+                self.host_used_bytes / (1024 * 1024),
+                self.host_resident.len()
+            );
+        }
+        Ok(true)
+    }
+
+    /// Pre-populate the host tier with as many registered weights as
+    /// fit in `host_budget_bytes`, in catalog iteration order. Used by
+    /// the loader as a one-shot warmup so first-touch promotions are
+    /// PCIe-bound (in-RAM) rather than NVMe-bound (on-disk) — for the
+    /// portion that fits.
+    ///
+    /// **Opportunistic**: if the budget is smaller than the catalog
+    /// total, the first N weights get cached and the rest fall through
+    /// to the v0.2 disk path on every page-in. Caller can also leave
+    /// warmup off and let the host tier fill lazily during forward
+    /// (same end state on the second pass).
+    pub fn prefetch_all_to_host(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        if self.config.host_budget_bytes == 0 {
+            return Ok(());
+        }
+        let ids: Vec<WeightId> = self.catalog.keys().copied().collect();
+        for id in ids {
+            // try_cold_load_into_host returns Ok(false) when the arena
+            // is full — keep iterating so trace stays useful; the
+            // remainder simply won't be host-cached.
+            self.prefetch_to_host(id, gpu)?;
+        }
+        Ok(())
+    }
+
+    fn touch_host_lru(&mut self, id: WeightId) {
+        if let Some(pos) = self.host_lru.iter().position(|x| *x == id) {
+            self.host_lru.remove(pos);
+            self.host_lru.push_back(id);
+        }
+    }
+
+    /// Host-tier eviction stub. v0.3-α only supports the
+    /// `host_budget_bytes ≥ total paged weights` regime (mode B —
+    /// permanent host residency); the bump-arena layout doesn't
+    /// support partial reclamation. Returns `BudgetExhausted` when
+    /// callers need more room than the arena was sized for. v0.3-β
+    /// will introduce a slab/free-list scheme to enable real eviction.
+    pub fn evict_host_lru_until(
+        &mut self,
+        need_bytes: u64,
+        _gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        Err(WeightPagerError::BudgetExhausted {
+            need_bytes,
+            in_use: self.host_used_bytes,
+            budget: self.config.host_budget_bytes,
+        })
+    }
+
+    /// Number of weights currently held in the host tier.
+    pub fn host_resident_count(&self) -> usize {
+        self.host_resident.len()
+    }
+
+    /// Bytes currently held in the host tier.
+    pub fn host_used_bytes(&self) -> u64 {
+        self.host_used_bytes
     }
 
     /// Patch the device-side `expert_*_ptrs` indirection table so the indexed
@@ -593,15 +882,21 @@ impl WeightPager {
         Ok(())
     }
 
-    /// Free all resident tensors back to the GPU pool. Called on model
-    /// teardown so VRAM goes back to the system. After this, the pager is
-    /// effectively reset (catalog stays, residency map is empty).
+    /// Free all resident tensors back to the GPU pool. Also frees the
+    /// pinned-host arena. Called on model teardown so VRAM and locked
+    /// RAM both return to the system. After this, the pager is
+    /// effectively reset (catalog stays, residency maps are empty).
     pub fn free_all(&mut self, gpu: &mut Gpu) {
         for (_id, r) in self.resident.drain() {
             let _ = gpu.free_tensor(r.tensor);
         }
         self.lru.clear();
         self.vram_used_bytes = 0;
+        self.host_resident.clear();
+        self.host_lru.clear();
+        self.host_used_bytes = 0;
+        // Vec<u8> arena drops naturally via take().
+        let _ = self.host_arena.take();
     }
 
     /// Get the resident tensor for `id`. Returns `None` if not resident
@@ -616,9 +911,16 @@ impl WeightPager {
     /// rewrites the underlying memory each time the active layer changes
     /// rather than allocating fresh GpuTensors.
     ///
-    /// Doesn't update the residency map (no entry is created — the
-    /// scratch buffer is owned by the caller, not the pager). Doesn't
-    /// participate in LRU.
+    /// **Host-tier-aware** (v0.3): when a pinned host shadow exists for
+    /// `id`, copies host→device at PCIe bandwidth and skips the disk
+    /// read entirely. When the host budget is set but `id` isn't yet
+    /// shadowed, the cold load goes through a freshly-allocated pinned
+    /// buffer that gets stashed for next time. With `host_budget == 0`,
+    /// falls back to the v0.2 path (`transport.fill_into` via unpinned
+    /// staging).
+    ///
+    /// Doesn't update the VRAM residency map (no entry is created — the
+    /// scratch buffer is caller-owned). Does touch host LRU on hit.
     pub fn fill_into(
         &mut self,
         id: WeightId,
@@ -629,6 +931,23 @@ impl WeightPager {
             .catalog
             .get(&id)
             .ok_or(WeightPagerError::NotRegistered(id))?;
+        let host_hit = self.host_resident.contains_key(&id)
+            || self.try_cold_load_into_host(id, range, gpu)?;
+        if host_hit {
+            {
+                let h = self.host_resident.get(&id).unwrap();
+                let arena = self.host_arena.as_ref().expect(
+                    "host_resident populated without host_arena — pager invariant",
+                );
+                gpu.hip.memcpy_htod(
+                    &dst.buf,
+                    &arena[h.offset..h.offset + h.bytes as usize],
+                )?;
+            }
+            self.touch_host_lru(id);
+            return Ok(());
+        }
+        // Host tier disabled or arena full — v0.2 path.
         self.transport.fill_into(range.offset, range.len, dst, gpu)?;
         Ok(())
     }
