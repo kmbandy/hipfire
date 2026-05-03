@@ -362,6 +362,10 @@ pub struct ExpertShape {
     pub down_m: usize,
     /// Input cols of down = `moe_intermediate_size`.
     pub down_k: usize,
+    /// GPU dtype of the expert weights. Stashed here so the paged dispatch
+    /// site can do dtype-based routing (MQ4 fast path vs mixed fallback)
+    /// without reading from `ffn.experts[0]` — which is empty in paged mode.
+    pub gpu_dtype: DType,
 }
 
 struct Resident {

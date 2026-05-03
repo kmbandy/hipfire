@@ -293,6 +293,12 @@ pub struct MoeFfnWeights {
     /// Qwen3.5-MoE-A3B has uniform per-expert shape so one descriptor per
     /// layer suffices for v0.1.
     pub expert_shape: Option<crate::weight_pager::ExpertShape>,
+
+    /// Clone of `Qwen35Weights.pager` — present in paged mode so the
+    /// per-layer dispatch site can reach the pager through `&MoeFfnWeights`
+    /// without threading `&RefCell<WeightPager>` through every forward
+    /// signature.
+    pub pager: Option<std::rc::Rc<std::cell::RefCell<crate::weight_pager::WeightPager>>>,
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -340,12 +346,19 @@ pub struct Qwen35Weights {
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
 
-    /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
-    /// with `Qwen35Config::paged_experts == true`. The forward path uses
+    /// Weight pager (MAD-93). `Some` only when the model was loaded with
+    /// `Qwen35Config::paged_experts == true`. The forward path uses
     /// interior mutability (`borrow_mut`) at the MoE dispatch site to call
     /// `ensure_resident` / `patch_expert_ptr_table`. `None` means the model
     /// is fully resident — no behavior change vs main.
-    pub pager: Option<std::cell::RefCell<crate::weight_pager::WeightPager>>,
+    ///
+    /// `Rc` (vs plain `RefCell`) so each `MoeFfnWeights` can hold a clone of
+    /// the same pager handle. Lets the per-layer paged dispatch site reach
+    /// the pager through `&MoeFfnWeights` without threading
+    /// `&RefCell<WeightPager>` through every forward signature. Migrates to
+    /// `Arc<Mutex<…>>` (or split-pager + channel) when the scheduler moves
+    /// to its own thread (v0.3+, [MAD-95](https://mad-lab-ai.atlassian.net/browse/MAD-95)).
+    pub pager: Option<std::rc::Rc<std::cell::RefCell<crate::weight_pager::WeightPager>>>,
 }
 
 impl Qwen35Weights {
@@ -412,11 +425,22 @@ impl Qwen35Weights {
                 }
             }
         }
-        // MAD-93 v0.1: in paged mode, the pager owns expert weight allocations
+        // MAD-93: in paged mode, the pager owns expert weight allocations
         // (the per-layer `free_moe_ffn` loops ran no-ops since `ffn.experts`
         // was empty). Drain the pager's resident set back to the GPU pool here.
-        if let Some(pager_cell) = self.pager {
-            pager_cell.into_inner().free_all(gpu);
+        // The Rc still has live clones from the (now-being-dropped) MoeFfnWeights;
+        // those drop in this same scope as we move the layers Vec, leaving us
+        // with the sole strong ref. unwrap_or_else handles the never-shouldnt-happen
+        // case where someone leaked an Rc clone.
+        if let Some(pager_rc) = self.pager {
+            match std::rc::Rc::try_unwrap(pager_rc) {
+                Ok(cell) => cell.into_inner().free_all(gpu),
+                Err(rc) => {
+                    // Other clones still alive — fall back to borrow_mut. Eviction
+                    // still happens; the Rc is dropped when this branch returns.
+                    rc.borrow_mut().free_all(gpu);
+                }
+            }
         }
     }
 }
@@ -925,6 +949,31 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 }
 
 pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
+    // MAD-93 v0.2: when paged_experts is set, build a WeightPager that the
+    // MoE loader threads through to register expert byte ranges (instead of
+    // eagerly allocating their VRAM). Each MoeFfnWeights gets a clone of
+    // this Rc so the per-layer dispatch site can reach the pager via
+    // `&MoeFfnWeights` without threading params through every forward
+    // signature. None when paged_experts=false — bit-for-bit unchanged from
+    // pre-paging behavior.
+    let pager_for_loader: Option<std::rc::Rc<std::cell::RefCell<crate::weight_pager::WeightPager>>> =
+        if config.paged_experts {
+            let pager_cfg = crate::weight_pager::PagerConfig {
+                vram_budget_bytes: config.vram_budget_bytes,
+                trace: std::env::var("HIPFIRE_PAGER_TRACE").is_ok(),
+            };
+            let pager = crate::weight_pager::WeightPager::with_pread_transport(
+                hfq.path(),
+                pager_cfg,
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &format!(
+                "failed to open HFQ file for paged transport: {}", e
+            )))?;
+            Some(std::rc::Rc::new(std::cell::RefCell::new(pager)))
+        } else {
+            None
+        };
+
     eprintln!("  loading token_embd...");
     let embd_info = hfq.tensor_data("model.language_model.embed_tokens.weight")
         .expect("embed_tokens not found");
@@ -1074,7 +1123,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
                     wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16)?,
+                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16, pager_for_loader.as_ref())?,
                 }));
             }
             (LayerType::FullAttention, true) => {
@@ -1090,7 +1139,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                     k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16)?,
+                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16, pager_for_loader.as_ref())?,
                 }));
             }
         }
@@ -1102,11 +1151,11 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
 
     Ok(Qwen35Weights {
         token_embd, embd_format: embd_fmt, output_norm, output, layers,
-        // MAD-93: paged construction goes through `load_weights_paged` (added
-        // alongside the moe_ffn_decode_impl wiring in a follow-up commit).
-        // The non-paged `load_weights` always returns `None` so today's
-        // callers see no behavior change.
-        pager: None,
+        // MAD-93: pager is constructed at the top of this function when
+        // `config.paged_experts == true`, threaded through the MoE loaders,
+        // and stored here so the forward path can reach it (and so
+        // `free_gpu` knows to drain the residency map on teardown).
+        pager: pager_for_loader,
     })
 }
 
@@ -1120,6 +1169,7 @@ fn load_moe_ffn(
     p: &str,
     config: &Qwen35Config,
     layer_idx: u16,
+    pager: Option<&std::rc::Rc<std::cell::RefCell<crate::weight_pager::WeightPager>>>,
 ) -> HipResult<MoeFfnWeights> {
     let n_exp = config.num_experts;
     let mi = config.moe_intermediate_size;
@@ -1140,44 +1190,125 @@ fn load_moe_ffn(
     // Stored as a 1×hidden row-vector.
     let shared_expert_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert_gate.weight"), 1, config.dim)?;
 
-    // Routed experts — quantizer wrote per-expert tensors named
-    // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
-    // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
-    let mut experts = Vec::with_capacity(n_exp);
-    for x in 0..n_exp {
-        let gate_up = load_weight_tensor(hfq, gpu,
-            &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
-            2 * mi, config.dim)?;
-        let down = load_weight_tensor(hfq, gpu,
-            &format!("{p}.mlp.experts.{x}.down_proj.weight"),
-            config.dim, mi)?;
-        experts.push(ExpertWeights { gate_up, down });
-    }
-
-    // Build the device-side pointer tables consumed by the indexed MoE
-    // GEMV kernels. Each slot is an `unsigned long long` (the device
-    // address of an expert's `gate_up.buf` / `down.buf`). Stored as an
-    // F32 tensor of length 2 * num_experts because each pointer occupies
-    // 8 bytes = 2 F32 slots; the kernel reads them via a u64 cast.
-    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    for e in &experts {
-        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
-        dn_ptrs.push(e.down.buf.buf.as_ptr()    as u64);
-    }
-    let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    let expert_down_ptrs    = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
-    gpu.hip.memcpy_htod(&expert_down_ptrs.buf,    &dn_bytes)?;
+    // Routed experts — two paths:
+    //   * **Non-paged** (`pager == None`): load all `n_exp` experts to VRAM
+    //     up front, populate the device-side ptr tables to point at those
+    //     allocations. Stable for the lifetime of the model.
+    //   * **Paged** (`pager == Some(_)`): register each expert's byte range
+    //     with the pager and skip the GPU allocation. `experts` stays empty;
+    //     the pager owns the (sometimes-resident) buffers and patches the
+    //     ptr table per-token via `patch_expert_ptr_table`. The ptr table
+    //     itself is still allocated and zero-initialized — the pager fills
+    //     active slots before each MoE GEMV.
+    let (experts, expert_shape, expert_gate_up_ptrs, expert_down_ptrs) = match pager {
+        None => {
+            // ─── Non-paged path (today's behavior) ───────────────────
+            let mut experts = Vec::with_capacity(n_exp);
+            for x in 0..n_exp {
+                let gate_up = load_weight_tensor(hfq, gpu,
+                    &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+                    2 * mi, config.dim)?;
+                let down = load_weight_tensor(hfq, gpu,
+                    &format!("{p}.mlp.experts.{x}.down_proj.weight"),
+                    config.dim, mi)?;
+                experts.push(ExpertWeights { gate_up, down });
+            }
+            // Device-side pointer tables. Each slot is u64 — stored in an F32
+            // tensor of length 2*n_exp (8 bytes/slot = 2 F32 slots; kernel
+            // reads via u64 cast).
+            let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+            let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+            for e in &experts {
+                gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
+                dn_ptrs.push(e.down.buf.buf.as_ptr()    as u64);
+            }
+            let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+            let expert_down_ptrs    = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+            gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
+            gpu.hip.memcpy_htod(&expert_down_ptrs.buf,    &dn_bytes)?;
+            (experts, None, expert_gate_up_ptrs, expert_down_ptrs)
+        }
+        Some(pager_rc) => {
+            // ─── Paged path (MAD-93 v0.2) ────────────────────────────
+            use crate::weight_pager::{ByteRange, ExpertRole, ExpertShape, WeightId};
+            // Register byte ranges for every expert's gate_up and down.
+            // Capture shape from expert 0 (A3B uniform-shape assumption —
+            // see `ExpertShape` doc).
+            let mut shape: Option<ExpertShape> = None;
+            {
+                let mut pager = pager_rc.borrow_mut();
+                // Tensor name resolution mirrors `load_weight_tensor`:
+                // try `model.language_model.<name>` first, fall back to bare
+                // `<name>`. Some HFQ writers include the prefix, some don't.
+                let resolve = |bare: &str| -> Option<&crate::hfq::HfqTensorInfo> {
+                    let prefixed = format!("model.language_model.{bare}");
+                    hfq.find_tensor_info(&prefixed).or_else(|| hfq.find_tensor_info(bare))
+                };
+                for x in 0..n_exp {
+                    let gate_up_name = format!("{p}.mlp.experts.{x}.gate_up_proj.weight");
+                    let down_name    = format!("{p}.mlp.experts.{x}.down_proj.weight");
+                    let gate_up_info = resolve(&gate_up_name)
+                        .ok_or_else(|| hip_bridge::HipError::new(0,
+                            &format!("missing tensor: {gate_up_name}")))?;
+                    let down_info = resolve(&down_name)
+                        .ok_or_else(|| hip_bridge::HipError::new(0,
+                            &format!("missing tensor: {down_name}")))?;
+                    pager.register(
+                        WeightId::Expert { layer: layer_idx, expert: x as u16, role: ExpertRole::GateUp },
+                        ByteRange { offset: gate_up_info.data_offset, len: gate_up_info.data_size },
+                    );
+                    pager.register(
+                        WeightId::Expert { layer: layer_idx, expert: x as u16, role: ExpertRole::Down },
+                        ByteRange { offset: down_info.data_offset, len: down_info.data_size },
+                    );
+                    if x == 0 {
+                        // A3B routed experts are typically MQ4G256
+                        // (`quant_type == 13`) in the shipped HFQ models.
+                        // The paged indexed-kernel fast path REQUIRES MQ4
+                        // routing — fall back / error early on other quant
+                        // types so we don't silently miscompute. Add other
+                        // accepted variants here when they're validated.
+                        let gpu_dtype = match gate_up_info.quant_type {
+                            13 => DType::MQ4G256, // MQ4-G256 (FWHT-rotated)
+                            other => return Err(hip_bridge::HipError::new(0,
+                                &format!(
+                                    "paged MoE expects MQ4G256 routed experts \
+                                     (quant_type 13); got {}. Other quants are \
+                                     not yet wired into the paged path.",
+                                    other
+                                ))),
+                        };
+                        shape = Some(ExpertShape {
+                            gate_up_m: 2 * mi,
+                            gate_up_k: config.dim,
+                            down_m: config.dim,
+                            down_k: mi,
+                            gpu_dtype,
+                        });
+                    }
+                }
+            }
+            // Allocate ptr tables zero-initialized — pager patches active
+            // slots per-token.
+            let zeros = vec![0u8; 8 * n_exp];
+            let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+            let expert_down_ptrs    = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+            gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &zeros)?;
+            gpu.hip.memcpy_htod(&expert_down_ptrs.buf,    &zeros)?;
+            (Vec::new(), shape, expert_gate_up_ptrs, expert_down_ptrs)
+        }
+    };
 
     Ok(MoeFfnWeights {
         router, experts, shared_expert, shared_expert_gate,
         expert_gate_up_ptrs, expert_down_ptrs,
         layer_idx,
-        // Non-paged path: shapes come from `experts[i].gate_up.{m, k}`.
-        expert_shape: None,
+        expert_shape,
+        // Clone the pager Rc so the per-layer dispatch site can reach it
+        // through `&MoeFfnWeights`. None when non-paged.
+        pager: pager.cloned(),
     })
 }
 
@@ -1418,16 +1549,41 @@ fn moe_ffn_decode_impl(
         None
     };
 
+    // MAD-93 v0.2: paged mode. When the pager is present, routed experts
+    // live on the pager (not in `ffn.experts`, which is empty), and the
+    // ptr table is patched per-token before the indexed kernel dispatch.
+    // We force `use_gpu_topk = false` so top-K runs on CPU — that's how
+    // the pager learns which experts to ensure resident before kernels read
+    // them.
+    let paged = ffn.pager.is_some();
+
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
-    let routed_mq4 = ffn.experts.first()
-        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
-    let routed_gate_up_mq4 = ffn.experts.first()
-        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
-    let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
+    //
+    // Paged mode reads dtype from `expert_shape` instead of `experts[0]`
+    // (which is empty in paged mode). A3B routed experts are MQ4G256.
+    let routed_mq4 = if paged {
+        ffn.expert_shape
+            .as_ref()
+            .map(|s| s.gpu_dtype == DType::MQ4G256)
+            .unwrap_or(false)
+    } else {
+        ffn.experts.first()
+            .map(|e| e.down.gpu_dtype == DType::MQ4G256)
+            .unwrap_or(false)
+    };
+    let routed_gate_up_mq4 = if paged {
+        ffn.expert_shape
+            .as_ref()
+            .map(|s| s.gpu_dtype == DType::MQ4G256)
+            .unwrap_or(false)
+    } else {
+        ffn.experts.first()
+            .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+            .unwrap_or(false)
+    };
+    let use_gpu_topk = !paged && k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
     // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
@@ -1524,7 +1680,24 @@ fn moe_ffn_decode_impl(
         gpu.ensure_mq_signs()?;
     }
 
-    if use_gpu_topk {
+    if paged {
+        // MAD-93 v0.2 paged dispatch:
+        //   - top-K was forced through CPU above (we have indices/weights as Vec)
+        //   - pager ensures each active expert resident in VRAM (cold-load if
+        //     needed, evict LRU if over budget)
+        //   - patch the device-side `expert_*_ptrs` table at active slots
+        //   - upload top-K indices+weights to the scratch device tensors that
+        //     the indexed kernels consume (same kernels as use_gpu_topk path)
+        let topk_indices = topk_indices_cpu.as_ref().expect("paged path implies CPU top-K");
+        let topk_weights = topk_weights_cpu.as_ref().expect("paged path implies CPU top-K");
+        let pager_rc = ffn.pager.as_ref().expect("paged_path implies pager Some");
+        let xr = x_rot_local.expect("paged A3B → gate_side_mq4 → x_rot_local");
+        let shape = ffn.expert_shape.as_ref().expect("paged path implies expert_shape Some");
+        qwen35_paged_moe_dispatch(
+            gpu, ffn, pager_rc, topk_indices, topk_weights,
+            xr, x_residual, s, mi, k, shape,
+        )?;
+    } else if use_gpu_topk {
         // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
         // IDs and weights from device buffers. 3 launches for routed
         // compute, zero D2H sync — hipGraph-capturable.
@@ -1611,6 +1784,89 @@ fn moe_ffn_decode_impl(
             }
         }
     }
+    Ok(())
+}
+
+/// Paged-mode routed MoE dispatch (MAD-93 v0.2).
+///
+/// Drop-in replacement for the routed-experts dispatch block in
+/// [`moe_ffn_decode_impl`] when `paged_experts == true`. Combines:
+/// 1. Pager `ensure_resident` for each active expert (cold-load + LRU evict
+///    if over budget).
+/// 2. `patch_expert_ptr_table` writes the resident expert buffer pointers
+///    into the device-side ptr table at the active slots.
+/// 3. CPU→device upload of top-K indices + weights into `s.topk_indices` /
+///    `s.topk_weights` (same scratch tensors the GPU-only top-K path
+///    populates).
+/// 4. The same indexed MoE GEMV kernels the `use_gpu_topk` path uses —
+///    they read expert pointers through the ptr table indirected by
+///    `s.topk_indices`. Kernels are arch-agnostic; the only thing
+///    qwen35-specific here is the kernel selection (HFQ4G256-flavored).
+///
+/// **Future**: when we add a second MoE arch (Mixtral-derivative etc.),
+/// this function's signature is exactly the trait method shape — extract
+/// to `MoeArch::paged_dispatch` then. Until then, concrete here keeps the
+/// PR readable without a speculatively-designed trait.
+#[cfg(feature = "deltanet")]
+fn qwen35_paged_moe_dispatch(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    pager_rc: &std::rc::Rc<std::cell::RefCell<crate::weight_pager::WeightPager>>,
+    topk_indices: &[usize],
+    topk_weights: &[f32],
+    xr: &GpuTensor,
+    x_residual: &GpuTensor,
+    s: &MoeScratchRef<'_>,
+    mi: usize,
+    k: usize,
+    shape: &crate::weight_pager::ExpertShape,
+) -> HipResult<()> {
+    use crate::weight_pager::{ExpertRole, WeightId};
+    let layer = ffn.layer_idx;
+
+    // Step 1+2: ensure each active expert resident, then patch ptr table.
+    {
+        let mut pager = pager_rc.borrow_mut();
+        for &idx in topk_indices {
+            pager.ensure_resident(
+                WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::GateUp },
+                gpu,
+            ).map_err(|e| hip_bridge::HipError::new(0, &format!("ensure_resident gate_up[{idx}] @ layer {layer}: {e}")))?;
+            pager.ensure_resident(
+                WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::Down },
+                gpu,
+            ).map_err(|e| hip_bridge::HipError::new(0, &format!("ensure_resident down[{idx}] @ layer {layer}: {e}")))?;
+        }
+        let active_u16: Vec<u16> = topk_indices.iter().map(|&i| i as u16).collect();
+        pager.patch_expert_ptr_table(
+            layer, &active_u16,
+            &ffn.expert_gate_up_ptrs, &ffn.expert_down_ptrs,
+            gpu,
+        )?;
+    } // borrow released before kernel dispatch
+
+    // Step 3: upload CPU top-K indices / weights into scratch device tensors.
+    // `s.topk_indices` is `[k] DType::F32` — same physical bytes as `[k] i32`,
+    // which is how the kernel reads them.
+    let indices_i32: Vec<i32> = topk_indices.iter().map(|&i| i as i32).collect();
+    let indices_bytes: Vec<u8> = indices_i32.iter().flat_map(|i| i.to_ne_bytes()).collect();
+    let weights_bytes: Vec<u8> = topk_weights.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&s.topk_indices.buf, &indices_bytes)?;
+    gpu.hip.memcpy_htod(&s.topk_weights.buf, &weights_bytes)?;
+
+    // Step 4: indexed MoE GEMV kernels (same as use_gpu_topk path).
+    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+        &ffn.expert_gate_up_ptrs, s.topk_indices,
+        xr, s.gate_batch, s.up_batch,
+        2 * mi, shape.gate_up_k,
+    )?;
+    gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+    gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed(
+        &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
+        s.rot_batch, x_residual,
+        shape.down_m, shape.down_k,
+    )?;
+
     Ok(())
 }
 
