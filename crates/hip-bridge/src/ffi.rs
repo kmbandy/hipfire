@@ -113,6 +113,9 @@ pub struct HipRuntime {
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    // Pinned (page-locked) host memory — flag = hipHostMallocDefault (0)
+    fn_host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32,
+    fn_host_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
@@ -253,6 +256,8 @@ impl HipRuntime {
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
                 fn_malloc: load_fn!(lib, "hipMalloc", unsafe extern "C" fn(*mut *mut c_void, usize) -> u32),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
+                fn_host_malloc: load_fn!(lib, "hipHostMalloc", unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32),
+                fn_host_free: load_fn!(lib, "hipHostFree", unsafe extern "C" fn(*mut c_void) -> u32),
                 fn_memcpy: load_fn!(lib, "hipMemcpy", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32),
                 fn_memcpy_async: load_fn!(lib, "hipMemcpyAsync", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32),
                 fn_memset: load_fn!(lib, "hipMemset", unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32),
@@ -342,6 +347,38 @@ impl HipRuntime {
         let code = unsafe { (self.fn_free)(buf.ptr) };
         std::mem::forget(buf); // prevent double-free
         self.check(code, "hipFree")
+    }
+
+    /// Allocate `size` bytes of pinned (page-locked) host memory via
+    /// `hipHostMalloc`. Pinned memory enables zero-copy DMA — H2D
+    /// transfers from a `HostBuffer` run at full PCIe bandwidth (~25
+    /// GB/s on PCIe 4.0) without bouncing through a kernel staging
+    /// buffer. The basis for the WeightPager v0.3 host tier.
+    ///
+    /// Allocation can be expensive on large sizes (the kernel must
+    /// reserve and lock physical pages), so callers should typically
+    /// allocate in big chunks once at warmup rather than per-tensor.
+    pub fn host_malloc(&self, size: usize) -> HipResult<crate::HostBuffer> {
+        let mut ptr: *mut c_void = ptr::null_mut();
+        // flags = 0 = hipHostMallocDefault — the standard "page-locked,
+        // accessible by the calling device" behavior. Don't request
+        // Portable / Mapped / WriteCombined — we don't need cross-device
+        // visibility or device-mapped pointers for the host-tier cache,
+        // and WriteCombined would penalize the CPU writes that
+        // `Transport::read_to_host` does on every cold prefetch.
+        let code = unsafe { (self.fn_host_malloc)(&mut ptr, size, 0) };
+        self.check(code, "hipHostMalloc")?;
+        Ok(unsafe { crate::HostBuffer::from_raw(ptr as *mut u8, size) })
+    }
+
+    /// Free pinned host memory previously allocated with `host_malloc`.
+    /// # Safety
+    /// Caller must ensure no in-flight DMA references the buffer.
+    pub fn host_free(&self, buf: crate::HostBuffer) -> HipResult<()> {
+        let ptr = buf.as_ptr() as *mut c_void;
+        std::mem::forget(buf); // prevent any future use
+        let code = unsafe { (self.fn_host_free)(ptr) };
+        self.check(code, "hipHostFree")
     }
 
     /// Copy host data into GPU buffer at a byte offset.

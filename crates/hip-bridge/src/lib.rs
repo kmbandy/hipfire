@@ -58,3 +58,57 @@ impl DeviceBuffer {
 // DeviceBuffer is Send — GPU pointers can be sent between threads.
 // They are NOT Sync — concurrent access requires stream synchronization.
 unsafe impl Send for DeviceBuffer {}
+
+/// Pinned (page-locked) host memory buffer. Allocated via `hipHostMalloc`
+/// — the OS guarantees the pages stay resident, which lets the DMA engine
+/// move data directly without bouncing through a temporary kernel buffer.
+/// Net effect: H2D throughput goes from ~5 GB/s (pageable) to ~25 GB/s
+/// (pinned) on PCIe 4.0 — the substrate for the WeightPager v0.3 host tier.
+///
+/// Caller owns the lifecycle: `HipRuntime::host_malloc` to allocate,
+/// `HipRuntime::host_free` to release. Like `DeviceBuffer`, this does
+/// **not** auto-drop — the FFI layer requires explicit free so the runtime
+/// can return errors and the higher layers can defer destruction past
+/// outstanding async transfers.
+pub struct HostBuffer {
+    ptr: *mut u8,
+    size: usize,
+}
+
+impl HostBuffer {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Borrow the pinned region as a byte slice. Safe as long as no
+    /// concurrent DMA is in flight against the same region (caller's
+    /// responsibility — pinned pages are still racy across CPU/GPU).
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+
+    /// Construct from a raw pointer + size without taking ownership.
+    /// The resulting buffer must NOT be freed.
+    /// # Safety
+    /// Caller must ensure `ptr` references valid pinned host memory of
+    /// at least `size` bytes that outlives this alias.
+    pub unsafe fn from_raw(ptr: *mut u8, size: usize) -> HostBuffer {
+        HostBuffer { ptr, size }
+    }
+}
+
+// HostBuffer is Send — pinned host pointers can be sent between threads.
+// Not Sync — concurrent CPU writes during in-flight DMA are unsafe.
+unsafe impl Send for HostBuffer {}
