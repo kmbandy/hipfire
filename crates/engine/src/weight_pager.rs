@@ -35,10 +35,11 @@
 //! into without changing the forward path.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::path::Path;
 
-use hip_bridge::{HipResult, DeviceBuffer};
-use rdna_compute::{Gpu, GpuTensor};
+use hip_bridge::HipResult;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::hfq::HfqFile;
 
@@ -129,21 +130,31 @@ pub struct TransferHandle(u64);
 /// Abstraction over how the pager moves bytes from host storage to VRAM.
 ///
 /// **This is the migration seam for the NVMe→VRAM DMA future.** Today's impl
-/// ([`PreadH2DTransport`]) does `pread` into a pinned host buffer then
+/// ([`PreadH2DTransport`]) does `pread` into a host staging buffer then
 /// `hipMemcpyAsync` to VRAM. A future `IoUringP2PTransport` reads directly
 /// into VRAM via `dma_buf` + io_uring with no host hop. The pager never sees
 /// the difference.
+///
+/// `fetch` is responsible for both the allocation (so io_uring can use a
+/// `dma_buf`-exportable slab when needed) and the transfer. `wait` exists for
+/// future async overlap; today's pread path completes synchronously inside
+/// `fetch` and `wait` is a no-op.
 pub trait Transport: Send {
-    /// Submit a transfer of `len` bytes starting at `hfq_offset` in the HFQ
-    /// file into the device buffer `dst`. Returns a handle to wait on.
-    fn submit(
+    /// Allocate a `GpuTensor` (with `DType::Raw`, shape `[len]`) and populate
+    /// it with `len` bytes from `hfq_offset` in the HFQ file. Returns the
+    /// fresh tensor and a handle that can be waited on.
+    ///
+    /// In v0.1 the transfer is synchronous (handle is informational); in
+    /// follow-ups the transport may submit async and have callers `wait`.
+    fn fetch(
         &mut self,
         hfq_offset: usize,
         len: usize,
-        dst: &DeviceBuffer,
-    ) -> HipResult<TransferHandle>;
+        gpu: &mut Gpu,
+    ) -> HipResult<(GpuTensor, TransferHandle)>;
 
-    /// Block until every handle in `handles` has completed.
+    /// Block until every handle in `handles` has completed. v0.1 no-op
+    /// because `fetch` is synchronous; defined for forward compatibility.
     fn wait(&mut self, handles: &[TransferHandle]) -> HipResult<()>;
 
     /// Hint: does this transport need pager-allocated VRAM slabs to be
@@ -160,31 +171,58 @@ pub trait Transport: Send {
     }
 }
 
-/// v0.1 transport: read via [`HfqFile::tensor_data_pread`]-style pread into a
-/// reusable host buffer, then `hipMemcpyAsync` to VRAM. Synchronous from the
-/// caller's POV in this commit (a follow-up uses a dedicated stream + event
-/// for true overlap).
+/// v0.1 transport: pread the requested byte range from the HFQ file into a
+/// reusable host buffer, then upload to VRAM via [`Gpu::upload_raw`]
+/// (which internally does `hipMalloc` + `hipMemcpy(H2D)`).
+///
+/// Synchronous in this commit. A follow-up commit replaces the staging with a
+/// pool of pinned (`hipHostMalloc`'d) buffers and uses `hipMemcpyAsync` on a
+/// dedicated stream so the next-layer prefetch can overlap with current-layer
+/// compute.
 pub struct PreadH2DTransport {
+    /// Owned file handle for the HFQ file. We open our own (rather than
+    /// borrowing `HfqFile`'s) so a future `IoUringP2PTransport` can register
+    /// its fd with io_uring + `dma_buf` independently. Path is held alongside
+    /// for diagnostics.
+    file: File,
+    path: std::path::PathBuf,
     /// Reusable host staging buffer. Grows monotonically to the largest
-    /// tensor size we've seen. Future commits replace this with a pool of
-    /// pinned (`hipHostMalloc`'d) buffers so transfers can actually overlap.
+    /// tensor size we've seen.
     staging: Vec<u8>,
-    /// Monotonic handle ID. v0.1 just uses this for debugging; transfers
-    /// complete synchronously inside `submit`.
+    /// Monotonic handle ID. v0.1 fetches complete synchronously, so this is
+    /// purely informational; future async impls will key real completion
+    /// state on this id.
     next_handle: u64,
-    /// File descriptor we pread from. Passed in by the caller because
-    /// [`HfqFile`] owns the `File` and exposes a pread helper.
-    /// In v0.1 we hold a borrow-equivalent indirectly via the pager.
-    _phantom: std::marker::PhantomData<()>,
 }
 
 impl PreadH2DTransport {
-    pub fn new() -> Self {
-        Self {
+    /// Open the HFQ file at `path` for paged reads.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        // Hint sequential-ish access for the page-cache layer. Tensors don't
+        // overlap so reads are effectively sequential within a tensor and
+        // random across tensors; the kernel's readahead handles the within
+        // case correctly with this advice.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+            }
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
             staging: Vec::new(),
             next_handle: 0,
-            _phantom: std::marker::PhantomData,
-        }
+        })
+    }
+
+    /// Path the transport was opened with. Useful for diagnostics + the
+    /// future io_uring impl which needs to register the same path with
+    /// io_uring SQE buffers.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn next_handle(&mut self) -> TransferHandle {
@@ -192,31 +230,54 @@ impl PreadH2DTransport {
         self.next_handle += 1;
         h
     }
-}
 
-impl Default for PreadH2DTransport {
-    fn default() -> Self {
-        Self::new()
+    /// Read `len` bytes at `offset` into `self.staging[..len]`. Linux uses
+    /// `pread` (positional read, no seek state); other platforms fall back
+    /// to `seek + read_exact` (correct but loses thread-safety on the file
+    /// — a non-issue today since the pager is single-threaded).
+    fn pread_into_staging(&mut self, offset: usize, len: usize) -> std::io::Result<()> {
+        if self.staging.len() < len {
+            self.staging.resize(len, 0);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut self.staging[..len], offset as u64)?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            self.file.seek(SeekFrom::Start(offset as u64))?;
+            self.file.read_exact(&mut self.staging[..len])?;
+        }
+        Ok(())
     }
 }
 
 impl Transport for PreadH2DTransport {
-    fn submit(
+    fn fetch(
         &mut self,
-        _hfq_offset: usize,
-        _len: usize,
-        _dst: &DeviceBuffer,
-    ) -> HipResult<TransferHandle> {
-        // v0.1 stub. The actual implementation reads through HfqFile's pread
-        // helper into `self.staging`, then does `gpu.memcpy_htod(dst, ...)`.
-        // Wired in the next commit when WeightPager::ensure_resident actually
-        // performs cold-load from disk; for now it's only called by code paths
-        // that aren't reachable in v0.1.
-        Ok(self.next_handle())
+        hfq_offset: usize,
+        len: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<(GpuTensor, TransferHandle)> {
+        // 1. Host: pread the bytes into our staging buffer.
+        self.pread_into_staging(hfq_offset, len)
+            .map_err(|e| {
+                hip_bridge::HipError::new(0, &format!(
+                    "pread {} bytes at offset {}: {}",
+                    len, hfq_offset, e
+                ))
+            })?;
+        // 2. GPU: alloc + memcpy_htod via the existing rdna-compute helper.
+        //    `dtype: Raw` because the pager doesn't care about element layout
+        //    — that interpretation belongs to `WeightTensor` at the call site.
+        let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
+        Ok((tensor, self.next_handle()))
     }
 
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
-        // Transfers complete synchronously inside `submit` in v0.1.
+        // Transfers complete synchronously inside `fetch` in v0.1.
         Ok(())
     }
 }
@@ -286,8 +347,12 @@ pub struct ByteRange {
 }
 
 struct Resident {
-    /// The actual VRAM buffer. Pager owns this allocation lifecycle.
-    _buffer: DeviceBuffer,
+    /// The actual VRAM tensor (pager owns its lifecycle). `dtype: Raw` —
+    /// callers reinterpret the bytes via their own `WeightTensor` wrapper at
+    /// access time. Storing as `GpuTensor` (rather than the lower-level
+    /// `DeviceBuffer`) keeps the pager idiomatic with the rest of the
+    /// rdna-compute API and lets us free via `gpu.free_tensor`.
+    tensor: GpuTensor,
     /// Cached byte length so eviction can update `vram_used_bytes` cheaply.
     bytes: u64,
 }
@@ -302,6 +367,14 @@ impl WeightPager {
             transport,
             config,
         }
+    }
+
+    /// Convenience: open `hfq_path` with the v0.1 pread+H2D transport.
+    /// Equivalent to constructing a [`PreadH2DTransport`] manually and passing
+    /// it to [`Self::new`].
+    pub fn with_pread_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
+        let transport = PreadH2DTransport::open(hfq_path)?;
+        Ok(Self::new(Box::new(transport), config))
     }
 
     /// Register that `id` lives at `range` in the HFQ file. Called by the
@@ -321,41 +394,62 @@ impl WeightPager {
         self.resident.contains_key(&id)
     }
 
-    /// Ensure `id` is in VRAM. Synchronous. v0.1: assumes the loader
-    /// pre-loaded everything on the always-resident path; raising
-    /// [`WeightPagerError::NotRegistered`] for unknown ids and `Unimplemented`
-    /// for cold-load on demand. The actual cold-load + LRU lifecycle wires
-    /// in the next commit (task #8).
+    /// Ensure `id` is in VRAM. Synchronous.
+    ///
+    /// Behavior:
+    /// - Already resident → mark recently-used, return Ok.
+    /// - Not registered (loader bug) → `NotRegistered` error, no GPU work.
+    /// - Cold (registered but not resident) → fetch via transport, allocate
+    ///   VRAM, populate, track residency. **No eviction yet** — task #9 adds
+    ///   the over-budget check that triggers `evict_lru_until` before fetch.
     pub fn ensure_resident(
         &mut self,
         id: WeightId,
-        _gpu: &mut Gpu,
-        _hfq: &HfqFile,
+        gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
-        if !self.catalog.contains_key(&id) {
-            return Err(WeightPagerError::NotRegistered(id));
-        }
         if self.resident.contains_key(&id) {
             self.touch_lru(id);
             return Ok(());
         }
-        // Future: budget check → maybe evict → transport.submit → transport.wait
-        // For v0.1 we surface this as Unimplemented so the caller knows the
-        // paged path isn't fully wired yet. Forward path checks
-        // `paged_experts` and stays on the always-resident codepath.
-        Err(WeightPagerError::Unimplemented(
-            "cold-load wired in next commit",
-        ))
+        let range = *self
+            .catalog
+            .get(&id)
+            .ok_or(WeightPagerError::NotRegistered(id))?;
+        // v0.1: no eviction. Once task #9 lands, we'll do:
+        //   if self.vram_used_bytes + range.len > config.vram_budget_bytes {
+        //       self.evict_lru_until(range.len)?;
+        //   }
+        let (tensor, _handle) = self.transport.fetch(range.offset, range.len, gpu)?;
+        self.vram_used_bytes = self.vram_used_bytes.saturating_add(range.len as u64);
+        self.resident.insert(id, Resident { tensor, bytes: range.len as u64 });
+        self.lru.push_back(id);
+        if self.config.trace {
+            eprintln!(
+                "[weight_pager] cold-load {id:?} ({} bytes) — {} resident, {} bytes used",
+                range.len,
+                self.resident.len(),
+                self.vram_used_bytes
+            );
+        }
+        Ok(())
     }
 
-    /// Insert an already-resident weight (used by the loader during initial
-    /// load — it allocates the VRAM and hands the pager a tracking entry).
-    pub fn insert_resident(&mut self, id: WeightId, buffer: DeviceBuffer, bytes: u64) {
+    /// Get the resident tensor for `id`. Returns `None` if not resident
+    /// (caller should `ensure_resident` first). Does not affect LRU.
+    pub fn get(&self, id: WeightId) -> Option<&GpuTensor> {
+        self.resident.get(&id).map(|r| &r.tensor)
+    }
+
+    /// Insert an already-resident weight. Used by the loader for
+    /// always-resident weights (token embeds, norms, the router itself in
+    /// v0.1) — they live in VRAM from startup but the pager tracks them so
+    /// they're visible to `get()` and accounted in `vram_used_bytes`.
+    pub fn insert_resident(&mut self, id: WeightId, tensor: GpuTensor, bytes: u64) {
         if let Some(prev) = self.resident.remove(&id) {
             self.vram_used_bytes = self.vram_used_bytes.saturating_sub(prev.bytes);
             self.lru.retain(|x| *x != id);
         }
-        self.resident.insert(id, Resident { _buffer: buffer, bytes });
+        self.resident.insert(id, Resident { tensor, bytes });
         self.lru.push_back(id);
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(bytes);
     }
@@ -447,6 +541,7 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn weight_id_is_hashable() {
@@ -459,24 +554,53 @@ mod tests {
         assert_eq!(map.get(&b), Some(&2));
     }
 
+    /// Write some bytes to a temp file and verify `PreadH2DTransport::open`
+    /// can read arbitrary ranges via the staging buffer. The actual upload
+    /// to GPU is exercised in integration tests; here we directly call the
+    /// pread helper to keep the unit test device-free.
     #[test]
-    fn pager_starts_empty() {
-        let pager = WeightPager::new(Box::new(PreadH2DTransport::new()), PagerConfig::default());
-        assert_eq!(pager.registered_count(), 0);
-        assert_eq!(pager.vram_used_bytes(), 0);
+    fn pread_transport_reads_range() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-test-{}.bin", std::process::id()));
+        let payload: Vec<u8> = (0..1024u32).flat_map(|i| (i as u8).to_le_bytes()).collect();
+        std::fs::File::create(&path).unwrap().write_all(&payload).unwrap();
+
+        let mut t = PreadH2DTransport::open(&path).unwrap();
+        // Read [256..768) — should match payload[256..768].
+        t.pread_into_staging(256, 512).unwrap();
+        assert_eq!(&t.staging[..512], &payload[256..768]);
+        // Read a smaller range; staging must cover it.
+        t.pread_into_staging(0, 16).unwrap();
+        assert_eq!(&t.staging[..16], &payload[..16]);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn ensure_resident_unknown_id_errors_clearly() {
-        let pager = WeightPager::new(Box::new(PreadH2DTransport::new()), PagerConfig::default());
-        // We can't construct a Gpu / HfqFile in a unit test without device
-        // access, but we can verify the registry-miss path does not touch
-        // them (it returns NotRegistered before any GPU/file work).
+    fn pager_starts_empty() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-empty-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        assert_eq!(pager.registered_count(), 0);
+        assert_eq!(pager.vram_used_bytes(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_then_get_returns_none_until_resident() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-reg-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let mut pager =
+            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         let id = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
-        // Safety: this path returns before dereferencing the &mut Gpu / &HfqFile,
-        // so passing zeroed/uninitialized references would be UB. Instead we
-        // assert at the API level by checking is_resident + catalog state.
+        pager.register(id, ByteRange { offset: 0, len: 1 });
+        assert_eq!(pager.registered_count(), 1);
+        // Catalog hit, not yet resident → get returns None.
         assert!(!pager.is_resident(id));
-        assert!(pager.catalog.get(&id).is_none());
+        assert!(pager.get(id).is_none());
+        // ensure_resident requires a real Gpu — exercised in integration tests.
+        let _ = std::fs::remove_file(&path);
     }
 }
