@@ -831,7 +831,19 @@ impl WeightPager {
                 .resident
                 .get(&down_id)
                 .unwrap_or_else(|| panic!("patch_expert_ptr_table: {down_id:?} not resident"));
-            // u64 pointer values, written into the device table at expert idx's slot.
+            // u64 pointer values, written into the device table at expert
+            // idx's slot. The `as u64` cast is correct because HIP device
+            // pointers are 64-bit values on every supported arch (gfx10+,
+            // gfx11, gfx12) and the host process is 64-bit; the device-
+            // side kernel reads these slots as `unsigned long` and
+            // dereferences them as device addresses, so wire format is
+            // identical to the host pointer's bit pattern. A non-null
+            // assertion catches the rare path where ensure_resident
+            // succeeded but the underlying alloc returned a sentinel.
+            debug_assert!(!gate_up_tensor.tensor.buf.as_ptr().is_null(),
+                "patch_expert_ptr_table: gate_up tensor has null device ptr for {gate_up_id:?}");
+            debug_assert!(!down_tensor.tensor.buf.as_ptr().is_null(),
+                "patch_expert_ptr_table: down tensor has null device ptr for {down_id:?}");
             let gate_up_ptr = gate_up_tensor.tensor.buf.as_ptr() as u64;
             let down_ptr = down_tensor.tensor.buf.as_ptr() as u64;
             let offset = (idx as usize) * 8;
@@ -866,6 +878,18 @@ impl WeightPager {
                     in_use: self.vram_used_bytes,
                     budget,
                 })?;
+            // Drift guard: the LRU should always contain the same set of
+            // ids as `resident`. If they diverge (e.g. a future caller
+            // forgets to update both maps in lockstep), we'd silently
+            // exit this loop early via BudgetExhausted instead of
+            // hitting the actual bug. Trap drift in debug builds; the
+            // release path stays the same `if let Some(_)` defensive
+            // continue (worst case: we evict more than necessary).
+            debug_assert!(
+                self.resident.contains_key(&id),
+                "weight_pager invariant: lru contains {id:?} but resident does not — \
+                 drift between LRU queue and residency map"
+            );
             if let Some(r) = self.resident.remove(&id) {
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);
