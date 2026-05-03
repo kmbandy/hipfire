@@ -136,6 +136,16 @@ pub struct Qwen35Config {
     /// for hybrid models (although Qwen3.6-27B has no MoE so only this
     /// flag matters for it; A3B has only MoE so only `paged_experts`).
     pub paged_dense: bool,
+
+    /// Soft cap on **pinned host RAM** the pager may hold (v0.3 host
+    /// tier). When `> 0`, paged weights are also cached in pinned host
+    /// memory after their first cold load, so subsequent VRAM
+    /// promotions copy host→device at PCIe bandwidth (~25 GB/s) rather
+    /// than re-reading from NVMe (~5 GB/s). Set above the model's
+    /// paged-weight footprint to make the host tier permanent (no host
+    /// eviction). `0` (default) disables the tier — behavior identical
+    /// to v0.2.
+    pub host_budget_bytes: u64,
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
@@ -203,6 +213,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         paged_experts: false,
         vram_budget_bytes: u64::MAX,
         paged_dense: false,
+        host_budget_bytes: 0,
     })
 }
 
@@ -1041,6 +1052,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         if config.paged_experts || config.paged_dense {
             let pager_cfg = crate::weight_pager::PagerConfig {
                 vram_budget_bytes: config.vram_budget_bytes,
+                host_budget_bytes: config.host_budget_bytes,
                 trace: std::env::var("HIPFIRE_PAGER_TRACE").is_ok(),
             };
             let pager = crate::weight_pager::WeightPager::with_pread_transport(
@@ -1237,6 +1249,27 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         // Drop mmap page cache for this layer (supplements pread-based loading).
         if let Some((start, end)) = layer_page_start {
             hfq.drop_pages_range(start, end - start);
+        }
+    }
+
+    // MAD-95 v0.3: warm the pinned-host tier. Once registration is done
+    // (every paged weight is in the catalog), if the operator gave us a
+    // host budget, prefetch the whole catalog to pinned RAM. After this
+    // returns, subsequent VRAM promotions are PCIe-bound, not NVMe-bound
+    // — the difference between ~5 GB/s and ~25 GB/s on PCIe 4.0.
+    //
+    // The warmup is a single sequential pass through the catalog, so it
+    // costs ≈ paged_total / nvme_bandwidth. For 27B (≈9 GB FFN) on a
+    // ~5 GB/s NVMe that's a one-time ~2 sec at load time. Caller pays
+    // it once; every forward thereafter stays off disk.
+    if let Some(pager_rc) = pager_for_loader.as_ref() {
+        if config.host_budget_bytes > 0 {
+            let mut p = pager_rc.borrow_mut();
+            p.prefetch_all_to_host(gpu).map_err(|e| {
+                hip_bridge::HipError::new(0, &format!(
+                    "host-tier warmup failed: {}", e
+                ))
+            })?;
         }
     }
 

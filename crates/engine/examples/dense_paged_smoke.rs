@@ -15,6 +15,10 @@
 //!   HIPFIRE_SMOKE_STEPS      — N greedy decode steps (default: 1)
 //!   HIPFIRE_SMOKE_KV         — q8 (default) | asym2 | asym3 | asym4
 //!   HIPFIRE_SMOKE_KV_SEQ     — KV cache size (default 256)
+//!   HIPFIRE_HOST_BUDGET_MB   — pinned-host tier budget (default: 0 = off, v0.2)
+//!                              Set above the paged-weight footprint to engage
+//!                              the v0.3 host-tier — paging then runs at full
+//!                              PCIe bandwidth instead of NVMe.
 //!   HIPFIRE_PAGER_TRACE      — when set, pager prints residency events
 
 #[cfg(not(feature = "deltanet"))]
@@ -43,6 +47,13 @@ fn main() {
         "this smoke test expects a DENSE model (num_experts=0); got {}", config.num_experts);
 
     config.paged_dense = true;
+    if let Ok(s) = std::env::var("HIPFIRE_HOST_BUDGET_MB") {
+        let mb: u64 = s.parse().expect("HIPFIRE_HOST_BUDGET_MB must be a u64");
+        config.host_budget_bytes = mb * 1024 * 1024;
+        eprintln!("Host (pinned-RAM) tier budget: {mb} MB");
+    } else {
+        eprintln!("Host (pinned-RAM) tier: disabled (set HIPFIRE_HOST_BUDGET_MB to engage v0.3)");
+    }
     eprintln!("paged_dense=true  ({}-layer dense, hidden_dim={}, dim={})",
         config.n_layers, config.hidden_dim, config.dim);
 
@@ -63,8 +74,9 @@ fn main() {
     }
     if let Some(p) = &weights.pager {
         let p = p.borrow();
-        eprintln!("Pager: registered {}, resident {}, used {} bytes",
-            p.registered_count(), p.resident_count(), p.vram_used_bytes());
+        eprintln!("Pager: registered {}, vram-resident {}, vram {} bytes; host-resident {}, host {} bytes",
+            p.registered_count(), p.resident_count(), p.vram_used_bytes(),
+            p.host_resident_count(), p.host_used_bytes());
     }
 
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
