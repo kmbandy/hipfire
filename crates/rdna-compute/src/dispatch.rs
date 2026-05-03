@@ -38,12 +38,13 @@ fn gemv_rows_default(arch: &str) -> u32 {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => 1,
         "gfx1030" | "gfx1031" => 1,
-        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X): wave64 native.
+        // Vega 20 / GCN5 (gfx906), CDNA1 (MI100, gfx908), and CDNA3
+        // (MI300X): wave64 native.
         // `gemv_hfq4g256_wide` uses block=[64,1,1] = exactly one wave —
         // zero lane waste. The 32-thread multirow variants run on half a
         // wave, so the wide kernel is the natural fit. Return rows=1 to
         // trigger use_wide.
-        "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
+        "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
         _ => 2,
     }
 }
@@ -61,7 +62,7 @@ fn has_dot2_f32_f16(arch: &str) -> bool {
         "gfx1011" | "gfx1012"
         | "gfx1030" | "gfx1031" | "gfx1032"
         | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-        | "gfx1150" | "gfx1151"
+        | "gfx1150" | "gfx1151" | "gfx1152"
         | "gfx1200" | "gfx1201")
 }
 
@@ -88,22 +89,57 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
-/// CDNA wave64-native arches: CDNA1 (gfx908, MI100) and CDNA3 (gfx94x,
-/// MI300X). On these, wave32 kernels (block=[32,1,1]) waste the upper 32
-/// lanes of every wave slot. The `*_wave64.hip` kernel variants pack two
-/// rows per block (one per warp) with block=[64,1,1] and halve the grid
-/// count. Adding gfx90a (CDNA2, MI200) here is a one-line change once it
-/// has been bring-up validated.
+/// Wave64-native arches: Vega 20 / GCN5 (gfx906), CDNA1 (gfx908, MI100),
+/// and CDNA3 (gfx94x, MI300X). On these, wave32 kernels (block=[32,1,1])
+/// waste the upper 32 lanes of every wave slot. The `*_wave64.hip` kernel
+/// variants pack two rows per block (one per warp) with block=[64,1,1] and
+/// halve the grid count. Adding gfx90a (CDNA2, MI200) here is a one-line
+/// change once it has been bring-up validated.
 fn has_wave64_native(arch: &str) -> bool {
-    matches!(arch, "gfx908" | "gfx940" | "gfx941" | "gfx942")
+    matches!(arch, "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942")
 }
 
 fn has_mmq_i8_wmma(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151")
+    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
 }
 
-fn prefer_dot2_hfq4_prefill(arch: &str) -> bool {
-    matches!(arch, "gfx1150" | "gfx1151")
+/// Decide whether the i8-WMMA MMQ prefill path should be used for a given
+/// GEMM call. Combines the arch gate, the env override, and an empirical
+/// batch-size threshold.
+///
+/// The MMQ kernel uses a 128×128 batch tile (vs the fp16 WMMA path's 16×16),
+/// so it amortizes its high per-launch fixed cost only when batch_size is
+/// large enough to fill multiple tiles. Empirical sweep on Qwen 3.5 9B
+/// (gfx1100, ROCm 7.2, residual at m=4096) across pp ∈ {32..512}:
+///
+///   pp32-pp192: MMQ regresses 23-69% (per-launch overhead dominates).
+///   pp224:      within noise (-8%).
+///   pp256+:     MMQ wins at multiples of 128 (+12% to +29%).
+///
+/// Default threshold is 256 — captures the pp256/pp384/pp512 wins (the
+/// pp512 case is the one issue #60 was filed about) while avoiding the
+/// catastrophic small-batch regression. Set `HIPFIRE_MMQ_MIN_BATCH=N` to
+/// override (e.g. 128 for aggressive routing, 384 for conservative).
+///
+/// `HIPFIRE_MMQ` env override:
+///   `0` / `off`            — force MMQ off (debug / regression bisect)
+///   `1` / `on`             — force MMQ on at every batch (legacy behavior)
+///   `auto` / unset / other — auto-route by batch_size threshold (default)
+fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
+    if !has_mmq_i8_wmma(arch) {
+        return false;
+    }
+    match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
+        Some("0") | Some("off") => false,
+        Some("1") | Some("on") => true,
+        _ => {
+            let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256);
+            batch_size >= min_batch
+        }
+    }
 }
 
 /// Tensor stored on the GPU. Tracks shape and element type.
@@ -153,6 +189,8 @@ pub enum DType {
     MQ4G256,   // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
     MQ8G256,   // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,   // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ3G256,   // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    MQ2G256,   // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -164,7 +202,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -198,11 +236,29 @@ pub struct Gpu {
     fp16_x_scratch_bytes: usize,
     /// Pointer to the last FP32 source that was converted to fp16_x_scratch.
     /// If the next GEMM uses the same X, skip the conversion.
-    fp16_x_source_ptr: *mut c_void,
+    pub fp16_x_source_ptr: *mut c_void,
     /// Q8_1/MMQ scratch for prefill activations. Layout matches llama.cpp's
     /// `block_q8_1_mmq`, ordered by [K/128 block, batch column].
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
     q8_1_mmq_x_scratch_bytes: usize,
+
+    // ── MMQ per-weight screening (#87) ──────────────────────────────────
+    // When enabled, each weight matrix is screened on first MMQ use: a
+    // small synthetic comparison (batch=16, WMMA vs MMQ) checks per-row
+    // max abs error. Weights exceeding the threshold fall back to WMMA.
+    //
+    // Enabled by default on RDNA3/3.5. Configurable via:
+    //   - config.json: `mmq_screen` (bool), `mmq_screen_threshold` (float)
+    //   - per-model config overlay
+    //   - daemon load params: `mmq_screen`, `mmq_screen_threshold`
+    //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
+    //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
+    mmq_screen_cache: HashMap<usize, bool>,
+    /// Whether MMQ per-weight screening is enabled. Default: true.
+    pub mmq_screen: bool,
+    /// Max per-row abs error threshold for screening. Weights with any row
+    /// exceeding this fall back to WMMA. Default: 0.10.
+    pub mmq_screen_threshold: f32,
 
     // ── hipGraph capture state ────────────────────────────────────────────
     /// When true, dispatch methods use the blob launch path (graph-capture-safe).
@@ -355,6 +411,7 @@ impl Gpu {
         let (hip_major, hip_minor) = hip.runtime_version().unwrap_or((0, 0));
         let (min_major, min_minor) = match arch.as_str() {
             "gfx1200" | "gfx1201" => (6, 4), // RDNA4 needs ROCm 6.4+
+            "gfx1150" | "gfx1151" | "gfx1152" => (7, 2), // RDNA3.5 (Strix) needs ROCm 7.2+
             "gfx1100" | "gfx1101" | "gfx1102" => (5, 5), // RDNA3 needs ROCm 5.5+
             _ => (5, 0),
         };
@@ -386,6 +443,12 @@ impl Gpu {
             fp16_x_source_ptr: std::ptr::null_mut(),
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
+            mmq_screen_cache: HashMap::new(),
+            mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
+                .map(|v| v == "1")
+                .unwrap_or(false),
+            mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
             capture_mode: false,
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
@@ -585,6 +648,14 @@ impl Gpu {
         self.capture_blobs.clear();
         self.graph_verify_n = None;
         self.graph_verify_warmup = 0;
+        // Without this, model swap leaves the flag stuck on `true`. The
+        // forward path in qwen35::forward_scratch then jumps straight from
+        // graph_exec.is_none() into capture mode on the new model's first
+        // AR forward call, before kernel JIT / scratch allocations have
+        // happened against the new tensors. That trips
+        // "hipMalloc not permitted under stream capture" the same way
+        // verify_warmed_up does for the DFlash verify path.
+        self.ar_forward_warmed_up = false;
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
@@ -906,7 +977,7 @@ impl Gpu {
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
-    fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
         self.ensure_kernel(
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
@@ -959,6 +1030,89 @@ impl Gpu {
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
+    /// comparison (batch=16): f16 WMMA vs MMQ on random activations. If any
+    /// output row's max abs error exceeds `mmq_screen_threshold`, the weight
+    /// is marked unsafe. Result is cached by device pointer.
+    ///
+    /// Returns `true` if MMQ is safe for this weight, `false` if it should
+    /// fall back to WMMA.
+    pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
+        let key = a_raw.buf.as_ptr() as usize;
+        if let Some(&safe) = self.mmq_screen_cache.get(&key) {
+            return safe;
+        }
+
+        let screen_batch = 16usize;
+        let threshold = self.mmq_screen_threshold;
+
+        // Generate synthetic activations on CPU
+        let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
+        let x_data: Vec<f32> = (0..screen_batch * k).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let t = (state >> 33) as f32 / (u32::MAX as f32);
+            t * 4.0 - 2.0
+        }).collect();
+
+        let result = (|| -> HipResult<bool> {
+            let x_gpu = self.upload_f32(&x_data, &[screen_batch * k])?;
+            let y_wmma = self.zeros(&[screen_batch * m], DType::F32)?;
+            let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
+
+            let saved_capture = self.capture_mode;
+            self.capture_mode = true;
+
+            // f16 WMMA reference
+            self.gemm_hfq4g256_residual_wmma(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
+
+            // MMQ path
+            let xq = self.ensure_q8_1_mmq_x(&x_gpu, screen_batch, k)?;
+            self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
+
+            self.capture_mode = saved_capture;
+            self.hip.device_synchronize()?;
+
+            let ref_out = self.download_f32(&y_wmma)?;
+            let mmq_out = self.download_f32(&y_mmq)?;
+
+            self.free_tensor(x_gpu).ok();
+            self.free_tensor(y_wmma).ok();
+            self.free_tensor(y_mmq).ok();
+
+            // Per-row max error check
+            let mut worst_row = 0usize;
+            let mut worst_err = 0f32;
+            for r in 0..m {
+                let mut row_max = 0f32;
+                for b in 0..screen_batch {
+                    let idx = b * m + r;
+                    let err = (ref_out[idx] - mmq_out[idx]).abs();
+                    if err > row_max { row_max = err; }
+                }
+                if row_max > worst_err {
+                    worst_err = row_max;
+                    worst_row = r;
+                }
+            }
+
+            let safe = worst_err <= threshold;
+            if !safe {
+                eprintln!(
+                    "  MMQ screen: UNSAFE weight ptr={key:#x} m={m} k={k} \
+                     worst_row={worst_row} max_err={worst_err:.4} > threshold={threshold:.4} — falling back to WMMA"
+                );
+            }
+            Ok(safe)
+        })();
+
+        let safe = result.unwrap_or_else(|e| {
+            eprintln!("  MMQ screen: error during screening ({e}), assuming unsafe");
+            false
+        });
+        self.mmq_screen_cache.insert(key, safe);
+        safe
     }
 
     /// Ensure an FP16 shadow of `w_mq4` (HFQ4-G256 format, [M × K]) exists in
@@ -1406,10 +1560,49 @@ impl Gpu {
         Ok(())
     }
 
-    /// Drain the GPU memory pool — actually calls hipFree on all pooled buffers.
+    /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
         self.pool.drain(&self.hip);
+    }
+
+    /// Invalidate every weight-pointer-keyed cache on the Gpu. Must be called
+    /// any time a loaded model's weights are about to be freed; otherwise the
+    /// next model load can allocate buffers at addresses that previously held
+    /// different weights and the cache will incorrectly hit on stale entries.
+    /// Affected caches:
+    ///   * mmq_screen_cache: per-weight (safe, unsafe) screening verdicts (#87).
+    ///   * fp16_shadow_cache: lazily-built FP16 dequant of HFQ4 weights for
+    ///     the rocBLAS prefill path (CDNA3-only). Owns GpuTensors, so the
+    ///     entries are released back to the pool here.
+    pub fn invalidate_weight_caches(&mut self) {
+        self.mmq_screen_cache.clear();
+        let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
+        for t in shadows {
+            let _ = self.free_tensor(t);
+        }
+    }
+
+    /// Tear down all captured hipGraphs + their kernarg blobs. Captured
+    /// graphs hold device pointers into the model's KV cache, scratch, and
+    /// draft weights baked into kernarg memory by hipStreamEndCapture. Once
+    /// any of those tensors are freed and the pool re-uses their buffers
+    /// for the next model, replaying the captured graph would execute against
+    /// either dangling or wrong-content pointers. The warmup sets would also
+    /// wrongly skip the per-B / per-n_steps JIT step on the new model. Must
+    /// be called from `unload_model` before the underlying tensors are
+    /// returned to the pool.
+    ///
+    /// Affected state:
+    ///   * graph_exec / captured_graph: single-slot AR forward graph.
+    ///   * verify_graph_cache + verify_warmed_up + verify_capturing_b:
+    ///     DFlash per-B verify-forward graphs.
+    ///   * replay_graph_cache + replay_warmed_up + replay_capturing_n:
+    ///     DFlash per-n_steps tape-replay graphs.
+    pub fn invalidate_graph_state(&mut self) {
+        self.graph_destroy();
+        self.verify_graph_destroy_all();
+        self.replay_graph_destroy_all();
     }
 
     // ── Kernel operations ───────────────────────────────────────
@@ -1975,6 +2168,41 @@ impl Gpu {
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
     }
 
+    /// MagnumQuant MQ3: rotate x once, then HFQ3-G256 GEMV against rotated x.
+    /// MQ3 weights are stored in HFQ3-G256 format (104 B/group) with FWHT pre-applied,
+    /// so the GEMV inner loop is identical to standard HFQ3.
+    pub fn gemv_mq3g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_hfq3g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ3 with pre-rotated x.
+    pub fn gemv_mq3g256_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq3g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ2: rotate x once, then HFQ2-G256 GEMV against rotated x.
+    /// MQ2 weights are stored in HFQ2-G256 format (72 B/group) with FWHT pre-applied.
+    pub fn gemv_mq2g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_hfq2g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ2 with pre-rotated x.
+    pub fn gemv_mq2g256_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq2g256(a_raw, x_rot, y, m, k)
+    }
+
     /// MagnumQuant MQ6: rotate x via FWHT, then HFQ6 GEMV.
     pub fn gemv_mq6g256_with_rotate(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
@@ -2049,17 +2277,83 @@ impl Gpu {
     }
 
     /// HFQ3-G256 GEMV. K must be multiple of 256.
+    /// Per-arch dispatch: gfx1100/1101/1102 uses the K4-unrolled
+    /// 4-accumulator variant. The default kernel was re-ported to match
+    /// the same ordering so non-RDNA3 archs (gfx1010, gfx1030, gfx12,
+    /// gfx9xx) produce byte-exact results against the RDNA3 baseline.
+    /// Uses `launch_maybe_blob` for HIPFIRE_GRAPH=1 capture safety.
     pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
-        self.ensure_kernel("gemv_hfq3g256", kernels::GEMV_HFQ3G256_SRC, "gemv_hfq3g256")?;
-        let func = &self.functions["gemv_hfq3g256"];
-        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32; let mut k_val = k as i32;
+        let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_hfq3g256")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "gemv_hfq3g256", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// HFQ3-G256 GEMV with fused residual add: y[row] += A[row] dot x.
+    /// Used by `weight_gemv_residual` MQ3 arm to eliminate the
+    /// alloc+gemv+add+free fallback chain (saves ~3 launches per residual).
+    /// gfx1100 selects the K4-unrolled chip-specific variant (commit 0003103,
+    /// 9B MQ3 decode 114 to 141 tok/s); other archs use the K4-ported default
+    /// (re-port in 9fdba4d keeps non-RDNA3 archs byte-exact with the prior
+    /// gemv + add_inplace path). Uses launch_maybe_blob for HIPFIRE_GRAPH=1
+    /// capture safety.
+    pub fn gemv_hfq3g256_residual(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_hfq3g256_residual")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_hfq3g256_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// MagnumQuant MQ3-G256 GEMV with fused residual add. The pre-rotation
+    /// happens in a separate kernel via fused_silu_mul_mq_rotate or
+    /// rotate_x_for_mq; this function just dispatches the underlying
+    /// hfq3g256_residual against the already-rotated x.
+    pub fn gemv_mq3g256_residual_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq3g256_residual(a_raw, x_rot, y, m, k)
     }
 
     /// HFQ3-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
@@ -2086,6 +2380,23 @@ impl Gpu {
             &mut ap as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
             &mut yp as *mut _ as *mut c_void, &mut mv as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ6-G256 GEMV with fused residual add: y[row] += A[row] . x.
+    /// Same shape as gemv_hfq6g256; only the final write differs (+= vs =).
+    /// Used for wo and w_down in HFQ6 / MQ6 forward paths so the
+    /// add_inplace_f32 follow-up launch can be elided.
+    pub fn gemv_hfq6g256_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, "gemv_hfq6g256_residual")?;
+        let func = &self.functions["gemv_hfq6g256_residual"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
         ];
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
@@ -2334,10 +2645,10 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X / gfx94x) wave64-native path:
+        // gfx906/gfx908/gfx94x wave64-native path:
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
-        // the wave slot. gfx908 added 2026-04-27 — kernel uses no MFMA, just
-        // FMA + shfl_down within wave64.
+        // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
+        // wave64, so it is safe for Vega 20 as well as CDNA.
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -2459,18 +2770,26 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
-                let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size) } else { Ok(()) };
-                let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size) } else { Ok(()) };
-                let r4 = if r3.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size) } else { Ok(()) };
-                return r1.and(r2).and(r3).and(r4);
+            if should_use_mmq(&self.arch, batch_size) {
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_qkv, qkv_m, k)
+                        && self.mmq_screen_weight(a_z, z_m, k)
+                        && self.mmq_screen_weight(a_beta, beta_m, k)
+                        && self.mmq_screen_weight(a_alpha, alpha_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+                    let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size) } else { Ok(()) };
+                    let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size) } else { Ok(()) };
+                    let r4 = if r3.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size) } else { Ok(()) };
+                    return r1.and(r2).and(r3).and(r4);
+                }
             }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) && !prefer_dot2_hfq4_prefill(&self.arch) {
+            if has_wmma_f16(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -2753,17 +3072,24 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size);
-                let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size) } else { Ok(()) };
-                let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_v, xq, y_v, v_m, k, batch_size) } else { Ok(()) };
-                return r1.and(r2).and(r3);
+            if should_use_mmq(&self.arch, batch_size) {
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_q, q_m, k)
+                        && self.mmq_screen_weight(a_k, k_m, k)
+                        && self.mmq_screen_weight(a_v, v_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size);
+                    let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size) } else { Ok(()) };
+                    let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_v, xq, y_v, v_m, k, batch_size) } else { Ok(()) };
+                    return r1.and(r2).and(r3);
+                }
             }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) && !prefer_dot2_hfq4_prefill(&self.arch) {
+            if has_wmma_f16(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -3027,18 +3353,24 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size);
-                let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size) } else { Ok(()) };
-                return r1.and(r2);
+            if should_use_mmq(&self.arch, batch_size) {
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_gate, gate_m, k)
+                        && self.mmq_screen_weight(a_up, up_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size);
+                    let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size) } else { Ok(()) };
+                    return r1.and(r2);
+                }
             }
             // WMMA on gfx12 (RDNA4)
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // WMMA on gfx11 (RDNA3)
-            if has_wmma_f16(&self.arch) && !prefer_dot2_hfq4_prefill(&self.arch) {
+            if has_wmma_f16(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -3296,6 +3628,210 @@ impl Gpu {
         result
     }
 
+    /// HFQ3-G256 sister of `gemm_qkvza_hfq4g256_wmma`. Same WMMA shape +
+    /// lane decomposition; only the inner K-tile unpack differs (3-bit
+    /// cross-byte vs 4-bit nibble) and the per-group byte stride is 104
+    /// instead of 136. Used for MQ3 prefill via dispatch wrappers that
+    /// pre-rotate `x` (see `gemm_qkvza_mq3g256_wmma` below). gfx11 K2
+    /// unroll variant — gfx12 K4 to follow once K2 is validated.
+    pub fn gemm_qkvza_hfq3g256_wmma(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if has_wmma_f16_gfx12(&self.arch) {
+            return self.gemm_qkvza_hfq3g256_wmma_gfx12(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+        }
+        self.ensure_kernel("gemm_qkvza_hfq3g256_wmma", kernels::GEMM_QKVZA_HFQ3G256_WMMA_SRC, "gemm_qkvza_hfq3g256_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        // HFQ3 storage = 104 B/group → ~3.06 bits/weight (vs HFQ4's 4.25).
+        let weight_bytes = (qkv_m + z_m + beta_m + alpha_m) * (k / 256) * 104;
+        let bytes = weight_bytes
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_hfq3g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m); b.push_i32(z_m_val); b.push_i32(b_m); b.push_i32(a_m);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3 wrapper: rotates `x` via `mq_rotate_x` (FWHT with shared sign
+    /// vectors) into the caller-provided `x_rot` scratch, then invokes
+    /// `gemm_qkvza_hfq3g256_wmma`. Mirror of `gemm_qkvza_mq4g256_wmma`.
+    /// Caller is responsible for `x_rot` being [batch × K] f32 scratch.
+    pub fn gemm_qkvza_mq3g256_wmma(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // Rotate batched x. mq_rotate_x_batched applies FWHT per-row.
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * k, k);
+            let x_rot_row = x_rot.sub_offset(b * k, k);
+            self.rotate_x_mq(&x_row, &x_rot_row, k)?;
+        }
+        // Invalidate the fp16-conversion cache: `x_rot`'s pointer is stable
+        // across consecutive MQ3 wrapper calls (same scratch buffer reused
+        // per layer), but the underlying data was just rewritten by the
+        // rotate loop above. Without this, `ensure_fp16_x` would see the
+        // matching `fp16_x_source_ptr` and skip the f32→fp16 conversion,
+        // and the kernel would read stale fp16 values from the previous
+        // layer's rotation.
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.gemm_qkvza_hfq3g256_wmma(
+            a_qkv, a_z, a_beta, a_alpha, x_rot,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+        )
+    }
+
+    /// gfx12 (RDNA4) sister of `gemm_qkvza_hfq3g256_wmma`. K4-unrolled
+    /// half8_t lane-split per `gemm_qkvza_hfq4g256_wmma_gfx12`. Wired via
+    /// the `gemm_qkvza_hfq3g256_wmma` arch dispatch — direct callers can
+    /// also use this if they know they're on gfx12.
+    pub fn gemm_qkvza_hfq3g256_wmma_gfx12(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_qkvza_hfq3g256_wmma_gfx12",
+            kernels::GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC,
+            "gemm_qkvza_hfq3g256_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = total_m * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_hfq3g256_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m); b.push_i32(z_m_val); b.push_i32(b_m); b.push_i32(a_m);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 (RDNA4) sister of `gemm_qkvza_hfq4g256_wmma`. Same gfx12
     /// recipe as the other scaffolds (validated on R9700) extended to
     /// 4-output qkv/z/beta/alpha routing. Not yet wired into the public
@@ -3453,6 +3989,82 @@ impl Gpu {
         result
     }
 
+    /// HFQ3-G256 sister of `gemm_qkv_hfq4g256_wmma`. Same WMMA shape +
+    /// lane decomposition; only the inner K-tile unpack differs (3-bit
+    /// cross-byte vs 4-bit nibble) and the per-group byte stride is 104
+    /// instead of 136. Used for MQ3 prefill via dispatch sites in
+    /// qwen35.rs FullAttention branch (X is pre-rotated upstream).
+    pub fn gemm_qkv_hfq3g256_wmma(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if has_wmma_f16_gfx12(&self.arch) {
+            return self.gemm_qkv_hfq3g256_wmma_gfx12(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+        }
+        self.ensure_kernel("gemm_qkv_hfq3g256_wmma", kernels::GEMM_QKV_HFQ3G256_WMMA_SRC, "gemm_qkv_hfq3g256_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = (q_m + k_m + v_m) * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_hfq3g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 (RDNA4) sister of `gemm_qkv_hfq4g256_wmma`. Identical signature
     /// and grid/block; only the kernel-side intrinsic + operand vector size
     /// differs. NOT yet wired into the public dispatch tree — exposed only
@@ -3544,7 +4156,17 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("gemm_gate_up_hfq4g256_wmma", kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC, "gemm_gate_up_hfq4g256_wmma")?;
+        // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
+        // (Gate 1 microbench, opt-in only, default off). See
+        // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
+        let variant_override = std::env::var("HIPFIRE_GATE_UP_VARIANT").ok();
+        let (kernel_name, kernel_src) = match variant_override.as_deref() {
+            Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
+            _            => ("gemm_gate_up_hfq4g256_wmma",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut ag = a_gate.buf.as_ptr();
@@ -3577,9 +4199,9 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(up_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_hfq4g256_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -3595,6 +4217,235 @@ impl Gpu {
         );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
+    }
+
+    /// HFQ3-G256 sister of `gemm_gate_up_hfq4g256_wmma`. Same WMMA shape
+    /// + lane decomposition; only the inner K-tile unpack differs (3-bit
+    /// cross-byte vs 4-bit nibble) and the per-group byte stride is 104
+    /// instead of 136. Used for MQ3 prefill via `gemm_gate_up_mq3g256_wmma`.
+    /// gfx12 (RDNA4) sister of `gemm_qkv_hfq3g256_wmma`.
+    pub fn gemm_qkv_hfq3g256_wmma_gfx12(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_qkv_hfq3g256_wmma_gfx12",
+            kernels::GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC,
+            "gemm_qkv_hfq3g256_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = total_m * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_hfq3g256_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_gate_up_hfq3g256_wmma(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if has_wmma_f16_gfx12(&self.arch) {
+            return self.gemm_gate_up_hfq3g256_wmma_gfx12(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
+        }
+        self.ensure_kernel("gemm_gate_up_hfq3g256_wmma", kernels::GEMM_GATE_UP_HFQ3G256_WMMA_SRC, "gemm_gate_up_hfq3g256_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut g_m = gate_m as i32;
+        let mut u_m = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut g_m as *mut _ as *mut c_void,
+            &mut u_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = (gate_m + up_m) * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_gate_up_hfq3g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(g_m); b.push_i32(u_m); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 (RDNA4) sister of `gemm_gate_up_hfq3g256_wmma`.
+    pub fn gemm_gate_up_hfq3g256_wmma_gfx12(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_gate_up_hfq3g256_wmma_gfx12",
+            kernels::GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC,
+            "gemm_gate_up_hfq3g256_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut g_m = gate_m as i32;
+        let mut u_m = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut g_m as *mut _ as *mut c_void,
+            &mut u_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = total_m * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_gate_up_hfq3g256_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(g_m); b.push_i32(u_m); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3 wrapper for `gemm_gate_up_hfq3g256_wmma`: pre-rotates X then
+    /// dispatches the HFQ3 kernel. See `gemm_qkvza_mq3g256_wmma` for
+    /// the cache-invalidation rationale.
+    pub fn gemm_gate_up_mq3g256_wmma(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * k, k);
+            let x_rot_row = x_rot.sub_offset(b * k, k);
+            self.rotate_x_mq(&x_row, &x_rot_row, k)?;
+        }
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.gemm_gate_up_hfq3g256_wmma(
+            a_gate, a_up, x_rot, y_gate, y_up, gate_m, up_m, k, batch_size,
+        )
     }
 
     /// gfx12 (RDNA4) sister of `gemm_gate_up_hfq4g256_wmma`. Same recipe
@@ -3766,6 +4617,11 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
 
+        // CDNA3 wave64 fast path: 2 rows per block, halves grid.x. The base
+        // kernel runs at half throughput on a wave64-native arch because
+        // half the wave masks out per `__shfl_down`. Byte-exact with base.
+        let cdna3 = has_wave64_native(&self.arch);
+
         // RDNA3 multi-row override path. Same selector as the non-residual
         // variant but there's currently no gfx1010-default multi-row residual
         // kernel, so non-RDNA3 archs still take the single-row residual path
@@ -3779,7 +4635,24 @@ impl Gpu {
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
-        let result = if use_multirow {
+        let result = if cdna3 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_residual_wave64",
+                kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                "gemv_hfq4g256_residual_wave64",
+            )?;
+            let grid = ((m as u32) + 1) / 2;
+            self.launch_maybe_blob(
+                "gemv_hfq4g256_residual_wave64",
+                [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                    b.push_i32(m_val); b.push_i32(k_val);
+                    b
+                },
+            )
+        } else if use_multirow {
             let (func_name, grid_div) = match rows {
                 2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
                 4 => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
@@ -4562,11 +5435,23 @@ impl Gpu {
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
             // Q8_1 activation quantize + i8 WMMA. ~+20% on pp≥256, larger on
             // Strix Halo. Experimental — see PR #73 / issue #60.
-            if (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
-                || std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1"))
-                && has_mmq_i8_wmma(&self.arch)
+            //
+            // When mmq_screen is true (default), each weight matrix is
+            // screened on first use: a small synthetic comparison detects
+            // outlier rows where Q8_1 precision loss exceeds the threshold
+            // (#87). Unsafe weights fall through to WMMA instead.
+            if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
+                || should_use_mmq(&self.arch, batch_size)
             {
-                return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_raw, m, k)
+                } else {
+                    true
+                };
+                if use_mmq {
+                    return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
+                }
+                // else: screening rejected this weight, fall through to WMMA
             }
             // WMMA on gfx12 (RDNA4): K2-unroll port, validated by
             // test_wmma_residual_gfx12 against the dot2 fp16 reference.
@@ -4839,7 +5724,7 @@ impl Gpu {
         result
     }
 
-    fn gemm_hfq4g256_mmq_set_prequant(
+    pub fn gemm_hfq4g256_mmq_set_prequant(
         &mut self,
         a_raw: &GpuTensor,
         x_q8_ptr: *mut c_void,
@@ -4943,12 +5828,25 @@ impl Gpu {
         //   ksplit — K-split + atomicAdd (non-deterministic accum order)
         //   k2     — 2× K-tile pipeline (byte-exact accum order)
         //   k2x32  — 32-row block with shared X fragment per K-tile. Slower
-        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo
-        //            for Qwen3.5 9B prefill (pp2048 q8: 339.7 → 351.3 tok/s).
-        //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
+        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo for
+        //            small-M residual projections at prefill-sized batches.
+        //            DFlash verify/lm_head runs at B<=16 and large-M draft
+        //            FFN/lm_head also prefer k2.
+        //   k4     — 4× K-tile pipeline. Fixed 2026-05-01 (commit pending):
+        //            output mapping was swapped relative to K2's canonical
+        //            wave32 WMMA C-mapping. Channel-test passes at K∈{256,512,4096}
+        //            × batch∈{1,2,4,16}. At m<8192 (9B residual at m=4096) K4
+        //            ties K2 within FP drift but loses to ksplit by ~33%
+        //            per-call at small batch (CU-starved grid: 3.3 vs 13
+        //            blocks/CU); auto-dispatch correctly stays on ksplit. K4
+        //            vs K2 at m≥8192 not yet benched on available models. See
+        //            plans/k4_plan.md.
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
-        let auto_variant = if matches!(self.arch.as_str(), "gfx1150" | "gfx1151") {
+        let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151" | "gfx1152");
+        let auto_variant = if is_gfx115x && batch_size <= 16 {
+            "k2"
+        } else if is_gfx115x && m < 8192 {
             "k2x32"
         } else if m >= 8192 {
             "k2"
@@ -5029,6 +5927,144 @@ impl Gpu {
                 kernel_name, m, k, batch_size, bytes / 1024, us, gbs);
         }
         result
+    }
+
+    /// HFQ3-G256 sister of `gemm_hfq4g256_residual_wmma` (basic WMMA
+    /// variant). Same WMMA shape + lane decomposition; only the inner
+    /// K-tile unpack differs (3-bit cross-byte vs 4-bit nibble) and the
+    /// per-group byte stride is 104 instead of 136. Y += acc[j] (fused
+    /// residual add — caller must initialize Y with the residual stream
+    /// before launching).
+    pub fn gemm_hfq3g256_residual_wmma(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if has_wmma_f16_gfx12(&self.arch) {
+            return self.gemm_hfq3g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
+        }
+        self.ensure_kernel("gemm_hfq3g256_residual_wmma", kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_SRC, "gemm_hfq3g256_residual_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = m * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq3g256_residual_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3 wrapper for `gemm_hfq3g256_residual_wmma`: pre-rotates X then
+    /// dispatches the HFQ3 kernel. See `gemm_qkvza_mq3g256_wmma` for
+    /// the cache-invalidation rationale.
+    /// gfx12 (RDNA4) sister of `gemm_hfq3g256_residual_wmma`.
+    pub fn gemm_hfq3g256_residual_wmma_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_hfq3g256_residual_wmma_gfx12",
+            kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC,
+            "gemm_hfq3g256_residual_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = m * (k / 256) * 104;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq3g256_residual_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_mq3g256_residual_wmma(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * k, k);
+            let x_rot_row = x_rot.sub_offset(b * k, k);
+            self.rotate_x_mq(&x_row, &x_rot_row, k)?;
+        }
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.gemm_hfq3g256_residual_wmma(a_raw, x_rot, y, m, k, batch_size)
     }
 
     /// MW16: dequant 4-bit weights to FP16, then run the no-dequant WMMA kernel.
@@ -5299,6 +6335,54 @@ impl Gpu {
             return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
+    }
+
+    /// HFQ3-G256 sister of `gemm_hfq4g256_batched_lmhead`. Same FP16-X cache
+    /// stomp + zero-init of Y, then `gemm_hfq3g256_residual_wmma` to compute
+    /// y[b][row] = A[row] · x[b]. Used by `dflash::gemm_dispatch` for MQ3
+    /// drafts so DFlash works with MQ3-quantized draft weights.
+    ///
+    /// Caller is responsible for FWHT-rotating x first when the weights are
+    /// MQ3 (FWHT-rotated at quant time) — `dflash::gemm_dispatch` handles
+    /// that via `rotate_x_mq_batched`. This wrapper is dtype-agnostic in
+    /// the same sense as `gemm_hfq4g256_batched_lmhead`.
+    pub fn gemm_hfq3g256_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // WMMA eligibility: any arch with an MQ3 WMMA family ported. Today
+        // that's gfx11 (RDNA3, _w32 builtin) and gfx12 (RDNA4, _w32_gfx12
+        // builtin) — `gemm_hfq3g256_residual_wmma` dispatches internally to
+        // the correct variant per arch. Other archs (gfx10/906/94x) fall
+        // through to the per-row GEMV path.
+        let wmma_eligible = batch_size > 1
+            && (has_wmma_f16(&self.arch) || has_wmma_f16_gfx12(&self.arch))
+            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+        if wmma_eligible {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            return self.gemm_hfq3g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        // Non-WMMA fallback: per-batch GEMV. Slow but functional. DFlash on
+        // non-gfx11/gfx12 archs is already gated upstream by the daemon's
+        // DFlash refusal guard (lm_head whitelist requires gfx11 or gfx12
+        // for MQ3) — this fallback is reachable only via direct callers
+        // that bypass the daemon (e.g., bench harnesses, channel tests).
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * k, k);
+            let y_row = y.sub_offset(b * m, m);
+            self.gemv_hfq3g256(a_raw, &x_row, &y_row, m, k)?;
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -11571,7 +12655,7 @@ impl Gpu {
                             kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
                 specs.push(("fused_gate_up_hfq4g256",
                             kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
-                // CDNA1 (gfx908) + CDNA3 (gfx94x) wave64-native variants — cut
+                // gfx906/gfx908/gfx94x wave64-native variants — cut
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
@@ -11631,7 +12715,7 @@ impl Gpu {
                             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
-                // CDNA1 (gfx908) + CDNA3 wave64 variants — see hfq4 branch for rationale.
+                // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
                 if has_wave64_native(&self.arch) {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
@@ -11776,6 +12860,18 @@ impl Gpu {
                     "gemv_hfq4g256_residual_multirow_r2",
                     "gemv_hfq4g256_residual_multirow_r4",
                     "gemv_hfq4g256_residual_multirow_r8",
+                ],
+                "gemv_hfq4g256_moe_gate_up_indexed_wave64" => vec![
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
+                ],
+                "gemv_hfq4g256_moe_down_indexed_wave64" => vec![
+                    "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64",
+                ],
+                "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64" => vec![
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
+                ],
+                "gemv_hfq4g256_moe_down_indexed_batched_wave64" => vec![
+                    "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64",
                 ],
                 other => vec![other],
             };

@@ -47,8 +47,28 @@ else
             if [ -n "$BASELINE_ARCH" ]; then break; fi
         fi
     done
+    if [ -z "$BASELINE_ARCH" ]; then
+        for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+            [ -f "$node_props" ] || continue
+            ver=$(awk '/gfx_target_version/ {print $2; exit}' "$node_props" 2>/dev/null || true)
+            case "$ver" in
+                90006)          BASELINE_ARCH="gfx906";  break ;;
+                90008)          BASELINE_ARCH="gfx908";  break ;;
+                100100)         BASELINE_ARCH="gfx1010"; break ;;
+                100300|100302)  BASELINE_ARCH="gfx1030"; break ;;
+                110000|110001)  BASELINE_ARCH="gfx1100"; break ;;
+                110501)         BASELINE_ARCH="gfx1151"; break ;;
+                120000)         BASELINE_ARCH="gfx1200"; break ;;
+                120001)         BASELINE_ARCH="gfx1201"; break ;;
+            esac
+        done
+    fi
+    if [ -z "$BASELINE_ARCH" ] && command -v rocminfo >/dev/null 2>&1; then
+        BASELINE_ARCH="$(rocminfo 2>/dev/null | awk '/^  Name:/ && $2 ~ /^gfx/ {print $2; exit}')"
+    fi
 fi
 case "${HSA_OVERRIDE_GFX_VERSION:-}" in
+    9.0.6|9.0) BASELINE_ARCH="gfx906" ;;
     10.1.0|10.1) BASELINE_ARCH="gfx1010" ;;
     10.3.0|10.3) BASELINE_ARCH="gfx1030" ;;
     11.0.0|11.0) BASELINE_ARCH="gfx1100" ;;
@@ -226,7 +246,12 @@ bench_run() {
     local model_path="$MODELS_DIR/qwen3.5-${size}.mq4"
     # givens4 was removed in the asym migration; asym3 is the current default
     # (5.5× compression, same speed regime as the old givens4 baseline).
-    local env_prefix="HIPFIRE_KV_MODE=asym3"
+    # DPM_WARMUP_SECS pins the GPU to high DPM before the timed prefill, so
+    # the measurement does not depend on idle/thermal state. Without it,
+    # pp32 single-shot drops ~16% from cold DPM (e.g. 9B 1240→1040) and the
+    # baseline becomes unreproducible across sessions. The DFlash bench
+    # arms below already set this; bench_qwen35_mq4 calls didn't.
+    local env_prefix="HIPFIRE_KV_MODE=asym3 HIPFIRE_DPM_WARMUP_SECS=3"
     # 0.8B has a known hipGraph panic; use plain path.
     if [ "$size" != "0.8b" ]; then
         env_prefix="$env_prefix HIPFIRE_GRAPH=1"

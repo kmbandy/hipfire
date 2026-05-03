@@ -8,7 +8,7 @@
 
 import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
-import { join, resolve, basename } from "path";
+import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
@@ -20,7 +20,7 @@ const TEMP_CORRECTION = 0.82;
 mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
-interface HipfireConfig {
+export interface HipfireConfig {
   kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
@@ -93,6 +93,13 @@ interface HipfireConfig {
   cask_beta: number;         // hysteresis buffer before re-triggering
   cask_core_frac: number;    // fraction of budget kept un-merged (CASK only)
   cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
+  // When true (default), `serve`/`run` auto-discover a TriAttention sidecar
+  // next to the loaded model file (registry's `triattn.file` first, then a
+  // glob fallback for `<basename>.triattn*.bin`) and engage CASK with the
+  // current policy values. The `off` profile disables this; explicit-`off`
+  // beats discovery. Already silently skipped on A3B targets regardless of
+  // this flag (R̄ hard rule).
+  cask_auto_attach: boolean;
 
   // ── Prompt-shape adaptation (0.1.8) ──────────────────────────────────
   // When true, collapses runs of 3+ '\n' chars to exactly 2 before the
@@ -101,6 +108,26 @@ interface HipfireConfig {
   // code prompts by up to +26.7% (commit 8a4a211). Default ON since
   // 2026-04-26 (commit 9a2c667).
   prompt_normalize: boolean;
+
+  // ── MMQ per-weight screening (#87) ──────────────────────────────────
+  // Tri-state guard for the i8 WMMA (MMQ) prefill path. When MMQ is
+  // active (HIPFIRE_MMQ=1 / HIPFIRE_WO_MMQ=1), Q8_1 precision loss on
+  // specific weight rows (e.g. row 3994 in Wo) can corrupt structured
+  // output (#87). Screening compares MMQ vs f16 WMMA per row and falls
+  // back to WMMA on outliers.
+  //   off:  never screen; if MMQ is active, all weights take the fast
+  //         path (max speed, risk of tool-call/JSON corruption).
+  //   on:   always screen on RDNA3/3.5 archs at load time. The daemon
+  //         already no-ops on non-RDNA3 archs, so this is safe to set
+  //         globally.
+  //   auto: same as `on` today; reserved so the daemon can promote or
+  //         demote per arch+model without forcing users to retune
+  //         their config. Default.
+  mmq_screen: "off" | "on" | "auto";
+  // Abs error threshold for MMQ screening. Weights with any output row
+  // exceeding this fall back to WMMA. Default 0.10 — validated on both
+  // qwen3.5-9b and qwen3.6-27b to produce byte-identical output vs WMMA.
+  mmq_screen_threshold: number;
 }
 
 // Detect GPU at import time for smart defaults
@@ -134,10 +161,18 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
+  cask_auto_attach: true,
   // Default ON since 2026-04-26: collapses \n{3,} → \n\n at engine entry,
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
+  // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
+  // WMMA. Default `auto`: the daemon arch-gates this to RDNA3/3.5
+  // (gfx1100/1101/1102/1103/1150/1151) and only fires when MMQ is active
+  // (HIPFIRE_MMQ=1). Set `off` for max speed (risks #87 tool-call
+  // corruption); set `on` to force the sweep.
+  mmq_screen: "auto",
+  mmq_screen_threshold: 0.10,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -164,7 +199,10 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_beta": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "cask_core_frac": return typeof value === "number" && value >= 0 && value <= 1;
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
+    case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
+    case "mmq_screen": return ["off", "on", "auto"].includes(value);
+    case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
     default: return false;
   }
 }
@@ -172,6 +210,12 @@ function validateConfigValue(key: string, value: any): boolean {
 function loadConfig(): HipfireConfig {
   try {
     const raw = JSON.parse(require("fs").readFileSync(CONFIG_PATH, "utf-8"));
+    // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 configs
+    // saved `false` (the prior PR #104 default). Coerce silently rather
+    // than dropping the key on validation failure.
+    if (typeof raw.mmq_screen === "boolean") {
+      raw.mmq_screen = raw.mmq_screen ? "on" : "off";
+    }
     const result = { ...CONFIG_DEFAULTS };
     for (const key of Object.keys(CONFIG_DEFAULTS)) {
       if (key in raw && validateConfigValue(key, raw[key])) {
@@ -207,7 +251,9 @@ const PER_MODEL_KEYS = [
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
+  "cask_auto_attach",
   "prompt_normalize",
+  "mmq_screen", "mmq_screen_threshold",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -218,13 +264,27 @@ function loadPerModelConfigs(): PerModelConfigs {
   try {
     const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
     const out: PerModelConfigs = {};
+    let migrated = false;
     for (const [tag, ov] of Object.entries(raw ?? {})) {
       const clean: PerModelOverride = {};
+      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
+      // overlays from PR #104 stored true/false; without this they'd fail the
+      // new tri-state validator and the override would silently disappear.
+      if (typeof (ov as any)?.mmq_screen === "boolean") {
+        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
+        migrated = true;
+      }
       for (const k of PER_MODEL_KEYS) {
         const v = (ov as any)?.[k];
         if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
       }
       if (Object.keys(clean).length > 0) out[tag] = clean;
+    }
+    // Persist migration so the legacy boolean doesn't sit in the file forever
+    // tripping every read. Best-effort: if the write fails (read-only fs,
+    // permission), the in-memory result is still correct for this run.
+    if (migrated) {
+      try { savePerModelConfigs(out); } catch {}
     }
     return out;
   } catch { return {}; }
@@ -354,6 +414,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
     }
   } else {
+    // Surface the #89 risk when the user explicitly opted into DFlash on an
+    // A3B target without a TriAttention sidecar. The "auto" path filters this
+    // case out silently (above), but mode === "on" is force-on and skips that
+    // gate — without this warning the user only finds out when a thinking
+    // turn loops on the last 1/3 of <think>. R̄≈0.39 is a structural ceiling
+    // (MoE routing variance); per-expert sidecars are the long-term fix.
+    if (isA3B && !hasSidecar && mode === "on") {
+      console.error(`[hipfire] WARNING: DFlash on A3B target without sidecar — known thinking-loop attractor (~20-40% rate on long greedy decode, see #89). Set dflash_mode=auto to disable, or attach a TriAttention sidecar.`);
+    }
     const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
     if (explicit !== undefined) {
       if (explicit.length > 0) params.draft = explicit;
@@ -362,16 +431,39 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       // Size segment may contain internal dashes (e.g. "35b-a3b"); stop only
       // at the quant-extension dot. Version digit is captured so the draft
       // prefix picks up qwen3.5 → qwen35 vs qwen3.6 → qwen36 correctly.
-      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
+      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq3|mq6|hfq4|hfq6|q8)/i);
       if (m) {
         const ver = m[1];                 // "5" or "6"
         const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
         const quant = m[3].toLowerCase();
-        const candidates = [
-          resolve(`${process.cwd()}/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
-          resolve(`${process.cwd()}/../../models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
-          resolve(`${homedir()}/.hipfire/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
+        // Candidate ordering combines two requirements:
+        //   1. dirname(target) goes FIRST. The most reliable signal we have
+        //      for "where this user keeps their weights" is the directory the
+        //      target was loaded from. In Docker (#110), process.cwd() is the
+        //      workdir but models are mounted elsewhere, so cwd-relative
+        //      paths never resolve. dirname-first works for Docker, raw
+        //      absolute paths, and registry-tag invocations alike.
+        //   2. mq3 target falls back to mq4 draft and vice versa, per the
+        //      DFlash MQ3 cross-matrix in d62acb0 (mq3 draft pairs correctly
+        //      with mq4 target and the reverse).
+        // For each search dir, try the target's matching quant first, then
+        // the cross-quant fallback.
+        const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
+        const dirs = [
+          dirname(path),
+          `${process.cwd()}/models`,
+          `${process.cwd()}/../../models`,
+          `${homedir()}/.hipfire/models`,
         ];
+        const candidates: string[] = [];
+        for (const d of dirs) {
+          candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${quant}.hfq`));
+        }
+        if (fallbackQuant) {
+          for (const d of dirs) {
+            candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${fallbackQuant}.hfq`));
+          }
+        }
         for (const c of candidates) {
           if (existsSync(c)) {
             params.draft = c;
@@ -387,6 +479,55 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // treats absent keys as "use engine defaults" so older daemons stay
   // compatible even when the CLI passes new keys.
   params.dflash_adaptive_b = resolved.dflash_adaptive_b;
+
+  // Auto-attach a TriAttention sidecar when:
+  //   (1) user hasn't manually set cask_sidecar (resolved value is empty)
+  //   (2) the loaded model file has a sidecar discoverable next to it
+  //   (3) the target is NOT A3B (R̄≈0.39 + eviction = confident-wrong
+  //       hallucination per feedback_a3b_r_not_acceptable.md)
+  //
+  // Discovery: registry entry's `triattn.file` first (manifest-driven), then
+  // glob-style fallback for `<model>.triattn*.bin` next to the weights for
+  // sidecars dropped manually.
+  let autoAttachedSidecar: string | null = null;
+  if (
+    (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
+    !isA3B &&
+    resolved.cask_auto_attach !== false
+  ) {
+    const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
+    const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
+    if (entry?.triattn?.file) {
+      const candidate = join(modelDir, entry.triattn.file);
+      if (existsSync(candidate)) autoAttachedSidecar = candidate;
+    }
+    if (!autoAttachedSidecar) {
+      // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
+      // hand-installed sidecars not in the registry.
+      try {
+        const baseName = basename(path);
+        const entries = readdirSync(modelDir);
+        const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
+        if (m) autoAttachedSidecar = join(modelDir, m);
+      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
+    }
+  }
+  if (autoAttachedSidecar) {
+    params.cask_sidecar = autoAttachedSidecar;
+    // Default policy on auto-attach: drop-eviction (cask=false) at the
+    // user's configured budget — typically 512 from runtime defaults, which
+    // is the `aggressive-vram` policy minus m-fold. Safe under DFlash too.
+    // User can switch to `balanced`/`conservative` via `hipfire config
+    // cask-profile`.
+    params.cask = resolved.cask;
+    params.cask_budget = resolved.cask_budget;
+    params.cask_beta = resolved.cask_beta;
+    params.cask_core_frac = resolved.cask_core_frac;
+    params.cask_fold_m = resolved.cask_fold_m;
+    console.error(`[hipfire] TriAttention sidecar auto-attached: ${autoAttachedSidecar}`);
+    console.error(`[hipfire]   ${resolved.cask ? 'CASK m-folding' : 'drop-eviction'} budget=${resolved.cask_budget} β=${resolved.cask_beta}  (override: hipfire config cask-profile <off|balanced|conservative|aggressive-vram>)`);
+  }
+
   if (resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
     if (existsSync(resolved.cask_sidecar)) {
       params.cask_sidecar = resolved.cask_sidecar;
@@ -400,6 +541,14 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       console.error(`[hipfire] WARN: cask_sidecar path missing: ${resolved.cask_sidecar} — disabling eviction for this load`);
     }
   }
+
+  // MMQ per-weight screening (#87). Tri-state at the CLI surface,
+  // boolean at the daemon. `auto` resolves to true today; the daemon
+  // arch-gates the sweep to RDNA3/3.5, so on non-RDNA3 archs this is a
+  // no-op. `off` forces the sweep off even on RDNA3 (max speed, risks
+  // #87 tool-call corruption).
+  params.mmq_screen = resolved.mmq_screen !== "off";
+  params.mmq_screen_threshold = resolved.mmq_screen_threshold;
 
   return { type: "load", model: path, params };
 }
@@ -420,6 +569,13 @@ interface ModelEntry {
   size_gb: number;
   min_vram_gb: number;
   desc: string;
+  /// Optional published TriAttention sidecar in the same HF repo. When set,
+  /// `hipfire pull` also fetches it next to the weights, and `serve`/`run`
+  /// auto-attaches the file at startup if `cask_sidecar` is unset and the
+  /// target isn't A3B. Sidecars on A3B targets are intentionally never
+  /// auto-attached — see feedback_a3b_r_not_acceptable.md (R̄≈0.36–0.39 +
+  /// eviction = confident-wrong hallucination on multi-turn).
+  triattn?: { file: string };
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -431,7 +587,7 @@ import registryData from "./registry.json" with { type: "json" };
 const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
 const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
-function resolveModelTag(input: string): string {
+export function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
   const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
   // Direct registry match
@@ -440,6 +596,12 @@ function resolveModelTag(input: string): string {
   if (ALIASES[normalized]) return ALIASES[normalized];
   // Try adding "qwen3.5:" prefix
   if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
+  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b.mq4"),
+  // find the registry entry whose .file matches and return its tag. Without this,
+  // per-model config is silently ignored when the user passes a raw filename.
+  for (const [tag, entry] of Object.entries(REGISTRY)) {
+    if (entry.file === normalized || entry.file === input) return tag;
+  }
   return normalized;
 }
 
@@ -605,7 +767,7 @@ function readServePid(): number | null {
 }
 
 // Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
-async function isServeUp(port: number): Promise<boolean> {
+export async function isServeUp(port: number): Promise<boolean> {
   try {
     const ctl = AbortSignal.timeout(500);
     const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctl });
@@ -736,7 +898,17 @@ class Engine {
         return JSON.parse(this.lines.shift()!);
       }
       const { value, done } = await this.reader.read();
-      if (done) throw new Error("daemon closed");
+      if (done) {
+        // The daemon closed its stdout. Most often this means the process
+        // exited: deliberately (e.g. friendly "no GPU" message + exit(1) on
+        // unsupported environments, see #112) or via a real crash. In either
+        // case, the daemon's stderr (which we inherit) already explained
+        // what happened, so adding a Bun-rendered stack trace from here on
+        // top is pure noise. Exit cleanly with the daemon's own code (or 1
+        // if it hasn't exited yet) and let stderr stand on its own.
+        const code = (await this.proc?.exited) ?? 1;
+        process.exit(code === 0 ? 1 : code);
+      }
       this.buffer += new TextDecoder().decode(value);
       const parts = this.buffer.split("\n");
       this.buffer = parts.pop() || "";
@@ -888,6 +1060,39 @@ async function pull(tag: string): Promise<string> {
 
   const sz = (statSync(dest).size / 1e9).toFixed(1);
   console.error(`  Saved: ${dest} (${sz}GB)`);
+
+  // TriAttention sidecar: fetch alongside the weights when the registry
+  // entry has one. Sidecars are tiny (≈2 MB) so we don't gate this on a
+  // flag — getting the .triattn.bin into MODELS_DIR is the prereq for the
+  // run/serve auto-attach to fire. Failures are non-fatal: weights are
+  // already on disk and runnable; the user just won't get auto-eviction.
+  if (entry.triattn?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.triattn.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  TriAttention sidecar already present: ${entry.triattn.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
+      console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
+      try {
+        const sres = await fetch(sidecarUrl);
+        if (!sres.ok) {
+          console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e6).toFixed(1);
+          console.error(`  Saved: ${sidecarDest} (${ssz}MB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
   return dest;
 }
 
@@ -984,10 +1189,18 @@ async function serve(port: number) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
-  try {
-    require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
-  } catch {}
-  const cleanupPid = () => { try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {} };
+  // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
+  // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
+  const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
+  if (ownsPidFile) {
+    try {
+      require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
+    } catch {}
+  }
+  const cleanupPid = () => {
+    if (!ownsPidFile) return;
+    try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+  };
   process.on("exit", cleanupPid);
   process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
   process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
@@ -1004,10 +1217,29 @@ async function serve(port: number) {
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
+  //
+  // CRITICAL: `lastRequestTime` is only bumped when a new request *arrives*
+  // (line below in the fetch handler). It is NOT updated while a long
+  // single request is generating. So a request that legitimately runs
+  // longer than idle_timeout — e.g. a thinking-heavy A3B turn that
+  // reasons for 4-6 minutes before answering — would have the eviction
+  // timer fire mid-stream, send `unload` to the daemon while it was
+  // emitting tokens, and silently kill the active generation. Reported by
+  // @mikiadev in #79 ("engine gives up after 300s while clearly still
+  // working in btop"). The CLI's SSE heartbeat keeps the *connection*
+  // alive but can't save the dispatch from this race.
+  //
+  // Fix: also gate eviction on `e.generating` — never unload while a
+  // generation is in flight, regardless of how stale lastRequestTime
+  // looks. Once the generate completes (`e.generating = false` in the
+  // streaming finally / non-streaming completion path), the timer's
+  // next tick re-evaluates and evicts cleanly if the connection has
+  // since gone idle.
   let lastRequestTime = Date.now();
   const idleTimeoutMs = cfg.idle_timeout * 1000;
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
     if (!current) return;                              // nothing to unload
+    if (e.generating) return;                          // active stream — don't yank
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
     try {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
@@ -1115,9 +1347,32 @@ async function serve(port: number) {
         let systemPrompt = "";
         let userPrompt = "";
 
-        // Extract system message
-        const sysMsg = messages.find((m: any) => m.role === "system");
-        if (sysMsg) systemPrompt = sysMsg.content;
+        // OpenAI API allows `content` to be a string OR an array of content
+        // parts (multi-modal: text + image). Pi coding agent and several other
+        // OpenAI clients send the array form even for text-only messages —
+        // raw `m.content` then stringifies to "[object Object]" as the
+        // prompt, which the model has no way to recover from. Issue #79.
+        // Image parts are filtered out (no vision encoder in serve path);
+        // matches the daemon's existing text-only behaviour.
+        const extractText = (content: any): string => {
+          if (typeof content === "string") return content;
+          if (Array.isArray(content)) {
+            return content
+              .filter((p: any) => p && p.type === "text")
+              .map((p: any) => p.text ?? "")
+              .join("");
+          }
+          return "";
+        };
+
+        // Extract system message. OpenAI's o1/o3-style reasoning surface
+        // (and pi-coding-agent) sends `role:"developer"` instead of
+        // `role:"system"` for the same purpose — strict instructions that
+        // outrank user messages. Treat both identically; first match wins
+        // if both happen to be present (last-wins would silently shadow
+        // an upstream system block).
+        const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
+        if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
         // Format tools into system prompt (Hermes format)
         if (tools.length > 0) {
@@ -1145,7 +1400,7 @@ async function serve(port: number) {
           s.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
            .replace(/<think>[\s\S]*$/, "");
 
-        const nonSystem = messages.filter((m: any) => m.role !== "system");
+        const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
         const convParts: string[] = [];
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
@@ -1153,9 +1408,9 @@ async function serve(port: number) {
           let text = "";
 
           if (role === "tool") {
-            text = `<tool_response>\n${m.content}\n</tool_response>`;
+            text = `<tool_response>\n${extractText(m.content)}\n</tool_response>`;
           } else if (role === "assistant") {
-            text = stripThinking(m.content || "");
+            text = stripThinking(extractText(m.content));
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
@@ -1163,7 +1418,7 @@ async function serve(port: number) {
               }
             }
           } else {
-            text = m.content || "";
+            text = extractText(m.content);
           }
 
           if (i === 0) {
@@ -1223,11 +1478,58 @@ async function serve(port: number) {
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
+        // OpenAI repeat-penalty mapping: take the larger of frequency_penalty
+        // and presence_penalty when present. Both are -2..2 in the OpenAI
+        // surface; we map non-negative values to repeat_penalty = 1 + p.
+        // (Negative penalties — boosts — aren't meaningful for hipfire's
+        // multiplicative repeat_penalty kernel, so they're treated as zero.)
+        // Requested by @shilga in #79; previously only frequency_penalty was
+        // honored.
+        const oaiPenalty = Math.max(
+          0,
+          Number(body.frequency_penalty) || 0,
+          Number(body.presence_penalty) || 0,
+        );
+        const oaiPenaltySet = body.frequency_penalty != null || body.presence_penalty != null;
+
+        // chat_template_kwargs (Qwen / DeepSeek / pi-coding-agent extension).
+        // Two recognized keys, both per-request overrides on top of
+        // global / per-model config:
+        //   enable_thinking   — false forces an effective no-think turn
+        //                       (max_think_tokens=1, model still emits <think>
+        //                       but is hard-capped to one token before
+        //                       being forced to close).
+        //   preserve_thinking — true leaves <think>...</think> intact in
+        //                       message.content (non-streaming) instead of
+        //                       stripping it. Streaming still uses the
+        //                       reasoning_content channel; this flag only
+        //                       affects the final concatenated message.
+        // Requested by @shilga in #79.
+        const ctk = (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object")
+          ? body.chat_template_kwargs : {};
+        const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
+        const preserveThinking: boolean = ctk.preserve_thinking === true;
+
+        // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
+        // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
+        // pass this when the user picks a reasoning depth in their UI. Map
+        // each level to a max_think_tokens cap; hipfire's thinking budget
+        // is the same shape (cap on tokens emitted inside <think>...</think>).
+        // none ≈ enable_thinking=false (hard 1-token cap so the model
+        // closes <think> immediately). xhigh stays uncapped (0). Requested
+        // by @mikiadev in #79.
+        const reasoning = (body.reasoning && typeof body.reasoning === "object") ? body.reasoning : null;
+        const effortMap: Record<string, number> = {
+          none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
+        };
+        const reasoningEffort: number | null = reasoning && typeof reasoning.effort === "string"
+          && reasoning.effort in effortMap ? effortMap[reasoning.effort] : null;
+
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
+          repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
         // Mirror the `hipfire run` path's per-model max_think_tokens
@@ -1237,6 +1539,19 @@ async function serve(port: number) {
         // Reported in #74 with qwen3.6:27b returning empty content + full
         // 8192 completion_tokens despite max_think_tokens=2048 in config.
         if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
+        // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
+        // token (model emits <think> then is forced to close). Overrides
+        // per-model max_think_tokens because the request semantics are more
+        // specific than the static config.
+        if (enableThinking === false) genParams.max_think_tokens = 1;
+        // reasoning.effort wins over both per-model and enable_thinking
+        // when present (it's the most explicit per-request signal). xhigh
+        // (0 = uncapped) only applies when set; we don't unconditionally
+        // clobber a per-model max_think_tokens with 0.
+        if (reasoningEffort !== null) {
+          if (reasoningEffort === 0) delete genParams.max_think_tokens;
+          else genParams.max_think_tokens = reasoningEffort;
+        }
         // thinking=off is currently a no-op at the CLI layer. Earlier
         // versions injected a prose system directive ("Respond directly
         // without using <think>...</think> reasoning blocks") here, but
@@ -1250,27 +1565,148 @@ async function serve(port: number) {
         if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
+        //
+        // Defensive against MQ4 quantization drift on structured-token positions
+        // (see #111). MQ4 FWHT rotation can shift the per-position distribution
+        // enough to flip greedy-decode argmax for `{`, `"`, `:`, `}` tokens, so
+        // the visible JSON sometimes lands in two off-spec shapes:
+        //   (a) flat: {"name": "write", "path": "...", "content": "..."}
+        //       (no `arguments` wrapper; args inlined as siblings of `name`).
+        //   (b) XML-corruption: <plain>write</param> {"path": "...", "content": "..."}
+        //       (Hermes / func-call template tokens leaking into JSON position).
+        // Both are still semantically recoverable: the model knows the function
+        // name and arg payload, just emits them in the wrong frame.
+        //
+        // The reverse-tag (`</tool_call>`) is not affected (single-token in BPE),
+        // so block boundary detection is reliable; only the inner payload needs
+        // repair.
+        //
+        // This is a stopgap. The proper fix is MQ4 calibration retraining with
+        // tool-call samples weighted on structured tokens; tracked in
+        // MANUAL_REVIEW.md against #111.
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
           if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
           const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
           const matches = [...text.matchAll(pattern)];
           if (!matches.length) return { content: text, tool_calls: null };
           const tool_calls: any[] = [];
+          let repaired = 0;
           for (const m of matches) {
-            const raw = (m[1] || m[2] || "").trim();
+            let raw = (m[1] || m[2] || "").trim();
             if (!raw) continue;
-            try {
-              const tc = JSON.parse(raw);
-              tool_calls.push({
-                id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-                type: "function",
-                function: { name: tc.name, arguments: JSON.stringify(tc.arguments || {}) }
-              });
-            } catch {}
+            // MQ4 single-token attractor (#111) sometimes stacks 1-2 nested
+            // `<tool_call>` openers before the JSON body lands. The engine
+            // blocks the third+ via the unclosed-depth gate in daemon.rs,
+            // but the second still ships in the visible stream. Strip any
+            // leading nested-opener artifacts before parsing — if the
+            // first non-whitespace bytes are another `<tool_call>`,
+            // discard them and use the inner content.
+            let nestedStripped = 0;
+            while (raw.startsWith("<tool_call>")) {
+              raw = raw.slice("<tool_call>".length).trimStart();
+              nestedStripped++;
+            }
+            if (!raw) continue;
+            const parsed = parseOneToolCall(raw);
+            if (!parsed) continue;
+            if (parsed.repaired || nestedStripped > 0) repaired++;
+            tool_calls.push({
+              id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+              type: "function",
+              function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) }
+            });
           }
           if (!tool_calls.length) return { content: text, tool_calls: null };
+          if (repaired > 0) {
+            // Single line on stderr so harness logs flag the recovery without
+            // breaking SSE streams or stdout JSON.
+            console.error(`[hipfire] tool_call: repaired ${repaired} malformed block(s) (MQ4 #111 stopgap)`);
+          }
           const before = text.slice(0, text.indexOf("<tool_call>")).trim();
           return { content: before || null, tool_calls };
+        }
+
+        // Returns {name, arguments, repaired} for valid or repairable blocks,
+        // null when the payload is unrecoverable. `repaired === true` means we
+        // had to coerce off-spec JSON / XML-tag shapes; valid OpenAI-spec input
+        // sets repaired=false.
+        function parseOneToolCall(raw: string): { name: string; arguments: any; repaired: boolean } | null {
+          // Form 1: spec-compliant {"name": ..., "arguments": {...}}.
+          try {
+            const tc = JSON.parse(raw);
+            if (tc && typeof tc === "object" && typeof tc.name === "string") {
+              if (tc.arguments !== undefined) {
+                return { name: tc.name, arguments: tc.arguments, repaired: false };
+              }
+              // Form 2: flat object with name + sibling args, no `arguments`
+              // wrapper. Treat every key other than `name` and a few known
+              // metadata keys as part of the arguments payload.
+              const drop = new Set(["name", "type", "id", "function"]);
+              const args: Record<string, any> = {};
+              let coerced = false;
+              for (const [k, v] of Object.entries(tc)) {
+                if (drop.has(k)) continue;
+                args[k] = v;
+                coerced = true;
+              }
+              if (coerced) return { name: tc.name, arguments: args, repaired: true };
+              // Bare `{"name": "X"}` with no args at all is legal for zero-arg
+              // tools; pass through.
+              return { name: tc.name, arguments: {}, repaired: false };
+            }
+          } catch {}
+
+          // Form 3: XML-tag corruption. Look for a function name in
+          //   <plain>NAME</param>  or  <function=NAME>  or  <NAME>
+          // patterns at the head of the block, followed by a JSON object.
+          const xmlPatterns = [
+            /^<\s*plain\s*>\s*([A-Za-z_][\w.]*)\s*<\s*\/\s*param\s*>/,
+            /^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>/,
+            /^<\s*tool\s*name\s*=\s*"?([A-Za-z_][\w.]*)"?\s*>/,
+          ];
+          for (const pat of xmlPatterns) {
+            const nm = raw.match(pat);
+            if (!nm) continue;
+            const after = raw.slice(nm[0].length).trim();
+            // Find the first balanced JSON object in the remainder.
+            const args = extractFirstJsonObject(after);
+            if (args !== null) {
+              return { name: nm[1], arguments: args, repaired: true };
+            }
+            // Even if we cannot parse args, the function name is usable;
+            // emit empty args rather than dropping the call entirely.
+            return { name: nm[1], arguments: {}, repaired: true };
+          }
+          return null;
+        }
+
+        // Best-effort balanced-brace JSON extraction. Returns the parsed
+        // object or null. Skips JSON inside strings.
+        function extractFirstJsonObject(s: string): any | null {
+          const start = s.indexOf("{");
+          if (start < 0) return null;
+          let depth = 0;
+          let inStr = false;
+          let escape = false;
+          for (let i = start; i < s.length; i++) {
+            const ch = s[i];
+            if (inStr) {
+              if (escape) { escape = false; continue; }
+              if (ch === "\\") { escape = true; continue; }
+              if (ch === '"') inStr = false;
+              continue;
+            }
+            if (ch === '"') { inStr = true; continue; }
+            if (ch === "{") depth++;
+            else if (ch === "}") {
+              depth--;
+              if (depth === 0) {
+                try { return JSON.parse(s.slice(start, i + 1)); }
+                catch { return null; }
+              }
+            }
+          }
+          return null;
         }
 
         if (body.stream) {
@@ -1280,6 +1716,27 @@ async function serve(port: number) {
           const hasTool = tools.length > 0;
           return new Response(new ReadableStream({
             async start(ctrl) {
+              // Prefill heartbeat: emit an SSE comment every 10s while no
+              // visible body bytes have been sent. The daemon's
+              // `forward_prefill_batch` is one synchronous device call per
+              // chunk and emits no events until the first sampled token, so on
+              // a 27B model with a 10–30K-token agent context (CLAUDE.md /
+              // AGENTS.md / skills / tools) the connection sits silent for 1–5
+              // minutes. OpenCode (#85) and pi-coding-agent (#79) have
+              // sub-minute first-byte/idle timeouts and abort. SSE comment
+              // lines (": …\n\n") are spec-required to be ignored by clients
+              // but keep the TCP connection — and any intermediary timer —
+              // alive. The flag is gated on actually enqueuing a visible
+              // chunk: thinking-block tokens are dropped and tool-mode tokens
+              // are buffered into `accumulated` and only flushed at `done`, so
+              // a "daemon emitted a token" signal does NOT mean the wire saw
+              // bytes — heartbeat must keep firing until the first real
+              // outgoing chunk.
+              let visibleChunkSent = false;
+              const heartbeat = setInterval(() => {
+                if (visibleChunkSent || streamCancelled) return;
+                try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
+              }, 10_000);
               try {
                 let inThink = false;
                 let stripNextLeadingNl = false;
@@ -1295,7 +1752,31 @@ async function serve(port: number) {
                         text = text.split("</think>").slice(1).join("</think>");
                         inThink = false;
                         stripNextLeadingNl = true;
-                      } else { continue; }
+                      } else {
+                        // Stream thinking-phase tokens as `reasoning_content`
+                        // (OpenAI-compatible field, also adopted by DeepSeek and
+                        // pi-coding-agent). Two reasons to do this even though
+                        // the visible-content stripper still removes
+                        // `<think>...</think>` from the assistant message:
+                        //   1) the wire stays alive — without this, a
+                        //      thinking-heavy turn (Qwen3.5/3.6 routinely 2–8K
+                        //      thinking tokens before answering) leaves the
+                        //      content stream silent for minutes, recreating
+                        //      the same idle-timeout failure mode the prefill
+                        //      heartbeat was added to fix (#79 / #85);
+                        //   2) clients that render reasoning UI (pi, OpenCode
+                        //      with reasoning visible) get a live thinking
+                        //      view rather than nothing.
+                        // Patch contributed by @mikiadev in #79.
+                        if (text) {
+                          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                            id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                            choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+                          })}\n\n`));
+                          visibleChunkSent = true;
+                        }
+                        continue;
+                      }
                     }
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
@@ -1307,8 +1788,11 @@ async function serve(port: number) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
                       })}\n\n`));
+                      visibleChunkSent = true;
                     }
                   } else if (msg.type === "done") {
+                    // Every path below enqueues at least the [DONE] sentinel.
+                    visibleChunkSent = true;
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -1352,6 +1836,7 @@ async function serve(port: number) {
                     ctrl.close();
                     return;
                   } else if (msg.type === "error") {
+                    visibleChunkSent = true;
                     // Propagate daemon-side errors (e.g. KV-budget rejection on a
                     // giant prompt) to the client instead of masking them as a
                     // normal zero-token "stop" — otherwise clients can't tell a
@@ -1368,6 +1853,7 @@ async function serve(port: number) {
                 // Safety: if loop exits without done/error (shouldn't happen), close stream
                 try { ctrl.close(); } catch {}
               } finally {
+                clearInterval(heartbeat);
                 e.generating = false;
                 safeRelease();
               }
@@ -1403,9 +1889,17 @@ async function serve(port: number) {
         // Strip think tags and special tokens.
         // Greedy match: strip everything from first <think> to last </think>.
         // If <think> is unclosed, strip from <think> to end of content.
-        content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-          .replace(/<think>[\s\S]*$/, "") // unclosed think block
-          .replace(/<\|im_end\|>/g, "").trim();
+        // chat_template_kwargs.preserve_thinking=true keeps <think>...</think>
+        // intact in message.content for clients that want a single-string
+        // representation including reasoning. <|im_end|> stripping always
+        // applies (it would break clients that re-encode message history).
+        if (preserveThinking) {
+          content = content.replace(/<\|im_end\|>/g, "").trim();
+        } else {
+          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+            .replace(/<think>[\s\S]*$/, "") // unclosed think block
+            .replace(/<\|im_end\|>/g, "").trim();
+        }
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
@@ -1665,7 +2159,7 @@ function loadUserAliases(): Record<string, UserAlias> {
   } catch { return {}; }
 }
 
-function findModel(name: string): string | null {
+export function findModel(name: string): string | null {
   // Direct file path
   if (existsSync(name)) return resolve(name);
 
@@ -2329,6 +2823,148 @@ interface FieldMeta {
 // pressed Enter on the "[per-model configs]" virtual row.
 type TuiExit = "exit" | "open_picker";
 
+// CASK profiles: curated bundles that map to concrete eviction behaviors.
+// Setting a profile rewrites the bundle in one shot.
+//
+// IMPORTANT: the daemon triggers eviction iff `cask_sidecar.is_some()`
+// (daemon.rs:798). The `cask` boolean only switches between m-fold and
+// drop-eviction; it does NOT disable eviction. Therefore the `off` profile
+// includes `cask_sidecar: ""` in its apply bundle — clearing the sidecar
+// path is the only way to actually disable eviction. Non-`off` profiles
+// leave `cask_sidecar` untouched (the user supplies the path).
+//
+// Why profiles vs raw knobs: the knobs interact non-obviously and have
+// hard-rule failure modes (m-fold + DFlash → block attractor; any sidecar
+// + A3B → confident-wrong hallucination at current R̄). A profile picker
+// collapses those into a small set of validated combinations.
+type CaskPolicyBundle = Pick<HipfireConfig, "cask" | "cask_budget" | "cask_beta" | "cask_core_frac" | "cask_fold_m">;
+type CaskProfileBundle = CaskPolicyBundle & { cask_sidecar?: string; cask_auto_attach?: boolean };
+interface CaskProfile {
+  label: string;
+  short: string;       // one-liner for the active row
+  desc: string;        // multi-line for the picker overlay
+  apply: CaskProfileBundle;
+  ar_only: boolean;    // true → warn if dflash_mode != off when this profile applied
+  a3b_safe: boolean;   // false → warn if applying to A3B target (per-model mode)
+}
+
+const CASK_PROFILES: Record<string, CaskProfile> = {
+  "auto": {
+    label: "auto",
+    short: "auto-attach if sidecar discoverable; otherwise no eviction",
+    desc: [
+      "Default behavior. At load time, scan for a published TriAttention sidecar",
+      "next to the model file (registry's `triattn.file` first, then a",
+      "`<basename>.triattn*.bin` glob fallback). When found AND target is not",
+      "A3B, attach with drop-eviction at the budget below. Otherwise behaves",
+      "identical to `off`.",
+      "",
+      "This is the pull-and-go path: `hipfire pull qwen3.6:27b` fetches the",
+      "v3 sidecar alongside weights, and `hipfire run` engages CASK on the",
+      "first turn with no further config.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_sidecar: "", cask_auto_attach: true },
+    ar_only: false,
+    a3b_safe: true,  // auto-attach already filters A3B; "auto" itself is a no-op on A3B
+  },
+  "off": {
+    label: "off",
+    short: "explicitly disable; clears sidecar AND auto-attach",
+    desc: [
+      "Hard-off: physical KV buffer = max_seq tokens (full allocation), no",
+      "eviction, no auto-attach. Clears cask_sidecar AND sets cask_auto_attach=false",
+      "so a sidecar-on-disk won't sneak back in via the discovery path.",
+      "Stricter than `auto` — pick this when you want eviction guaranteed off.",
+      "",
+      "Use when:",
+      "  • Plenty of VRAM relative to context goal",
+      "  • Model is A3B (eviction is unsafe at current R̄≈0.36–0.39)",
+      "  • Quality-sensitive single-turn workloads",
+      "Only profile that's safe on 35B-A3B today.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_sidecar: "", cask_auto_attach: false },
+    ar_only: false,
+    a3b_safe: true,
+  },
+  "balanced": {
+    label: "balanced",
+    short: "drop-eviction, budget=1024 (~165 MB KV on 27B asym3)",
+    desc: [
+      "Plain TriAttention drop-eviction at budget=1024.",
+      "physical_cap ≈ 1280 slots regardless of advertised max_seq.",
+      "Lets a 16 GB card fit dense 27B with usable long context.",
+      "Per-eviction quality cost on AR ≈ 1.7% (graceful).",
+      "m-fold OFF — no DFlash regression risk; works on AR or DFlash.",
+      "Dense models only — A3B safety not validated at this budget.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 1024, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2, cask_auto_attach: true },
+    ar_only: false,
+    a3b_safe: false,
+  },
+  "conservative": {
+    label: "conservative",
+    short: "drop-eviction, budget=2048 (≥20 GB headroom)",
+    desc: [
+      "Plain TriAttention drop-eviction at budget=2048.",
+      "physical_cap ≈ 2304 slots. Use when you have ≥20 GB VRAM and",
+      "want predictable VRAM footprint with very long advertised contexts.",
+      "Same per-event quality cost as balanced (~1.7% on AR), but evicts",
+      "less often → fewer cumulative events, smoother quality curve.",
+      "Dense models only.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 2048, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2, cask_auto_attach: true },
+    ar_only: false,
+    a3b_safe: false,
+  },
+  "aggressive-vram": {
+    label: "aggressive-vram",
+    short: "CASK m-fold, budget=512 (~96 MB KV on 27B asym3)",
+    desc: [
+      "CASK m-fold at the paper's frac=0.25 sweet spot (budget=512, m=2).",
+      "physical_cap ≈ 896 → ~96 MB KV on dense 27B asym3.",
+      "Pins VRAM hard — a 16 GB card fits 27B with a comfortable margin.",
+      "Validated +11 pts vs drop-eviction at this aggressive budget (paper §4).",
+      "",
+      "AR ONLY: m-fold + DFlash has a documented block-attractor regression",
+      "(feedback_cask_mfold_dflash_broken.md). Set dflash_mode=off when using",
+      "this profile. NOT for A3B at current R̄.",
+    ].join("\n"),
+    apply: { cask: true, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_auto_attach: true },
+    ar_only: true,
+    a3b_safe: false,
+  },
+};
+
+// Maps the current effective values to a profile name. Returns "custom" if
+// no profile exactly matches — this is what `hipfire config list` shows for
+// users who hand-tuned individual knobs. Compares each key declared in the
+// profile's `apply` bundle, so `off` (which includes `cask_sidecar: ""`)
+// requires the sidecar path to actually be empty before it matches.
+function detectCaskProfile(values: Pick<HipfireConfig, keyof CaskPolicyBundle | "cask_sidecar">): string {
+  for (const [name, p] of Object.entries(CASK_PROFILES)) {
+    let matches = true;
+    for (const [k, v] of Object.entries(p.apply)) {
+      const cur = (values as any)[k];
+      if (typeof v === "number" && typeof cur === "number") {
+        if (Math.abs(cur - v) > 1e-9) { matches = false; break; }
+      } else if (cur !== v) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return name;
+  }
+  return "custom";
+}
+
+// Heuristic: does the resolved tag refer to an A3B model? Used to flag the
+// (any-eviction, A3B) hard-rule when applying a non-"off" profile in per-
+// model mode.
+function tagIsA3B(tag: string | null | undefined): boolean {
+  if (!tag) return false;
+  return /a3b/i.test(tag);
+}
+
 // Scope = null → edit global config. Scope = tag string → edit per-model
 // overlay for that tag. Per-model mode shows inherited values dimmed and
 // highlights overrides in cyan; `r` removes an override.
@@ -2346,9 +2982,20 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const keys = isPerModel
     ? allKeys.filter(k => (PER_MODEL_KEYS as readonly string[]).includes(k))
     : allKeys;
-  // Virtual rows (nav-only, not real config keys). Only in global mode.
-  const navKeys = isPerModel ? [] : ["__per_model__"];
+  // Virtual rows (nav-only, not real config keys). `__cask_profile__` is
+  // shown in both global and per-model modes — CASK is per-model overridable
+  // and the profile bundle is exactly what most users want to change in the
+  // per-model A3B/dense distinction. `__per_model__` is global-only.
+  const navKeys = isPerModel
+    ? ["__cask_profile__"]
+    : ["__cask_profile__", "__per_model__"];
   const totalRows = keys.length + navKeys.length;
+
+  // Inline modal state for the CASK profile picker. Open on Enter from the
+  // __cask_profile__ row; close on Enter (apply) or Esc (cancel).
+  const profileNames = Object.keys(CASK_PROFILES);
+  let profilePickerOpen = false;
+  let profilePickerSelected = 0;
 
   // Effective value for a key: override wins in per-model mode, else cfg.
   const effective = (k: keyof HipfireConfig): any =>
@@ -2470,10 +3117,25 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "CASK m-fold factor (1 = no folding, 2+ = fold m heads into one)",
       range: [1, 16], step: 1,
     },
+    cask_auto_attach: {
+      label: "cask_auto_attach",
+      desc: "auto-discover .triattn.bin next to model file at load (true) or never (false). cask-profile=off sets false; non-off profiles set true.",
+      options: ["true", "false"],
+    },
     prompt_normalize: {
       label: "prompt_normalize",
       desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
       options: ["true", "false"],
+    },
+    mmq_screen: {
+      label: "mmq_screen",
+      desc: "MMQ Q8_1 outlier-row screening (#87). off = max prefill speed, risks tool-call/JSON corruption on some weights. on = always screen on RDNA3/3.5 at load. auto = let the daemon decide per arch (default).",
+      options: ["off", "on", "auto"],
+    },
+    mmq_screen_threshold: {
+      label: "mmq_screen_threshold",
+      desc: "max abs error tolerated per output row before falling back to WMMA. 0.10 validated on 9B/27B; lower = stricter (more weights screened, slower).",
+      range: [0.01, 1.0], step: 0.01, decimals: 2,
     },
   };
 
@@ -2577,7 +3239,42 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     editBuffer = "";
   };
 
+  const renderProfilePicker = () => {
+    write("\x1b[H\x1b[2J");
+    write(`${C.bold}cask profile${C.reset}  ${C.dim}${isPerModel ? `per-model overlay for ${resolvedTag}` : "global config"}${C.reset}\n`);
+    write(`${C.dim}Pick a preset to set the (cask, cask_budget, cask_beta, cask_core_frac, cask_fold_m)\nbundle in one shot. cask_sidecar is preserved — set its path separately.${C.reset}\n\n`);
+
+    const a3bWarn = isPerModel && tagIsA3B(resolvedTag);
+    const dflashOn = effective("dflash_mode") !== "off";
+
+    for (let i = 0; i < profileNames.length; i++) {
+      const name = profileNames[i];
+      const p = CASK_PROFILES[name];
+      const caret = i === profilePickerSelected ? `${C.cyan}▸${C.reset}` : " ";
+      const title = `${caret} ${C.bold}${p.label.padEnd(18)}${C.reset} ${C.dim}${p.short}${C.reset}`;
+      write(`${title}\n`);
+      if (i === profilePickerSelected) {
+        for (const line of p.desc.split("\n")) write(`     ${C.dim}${line}${C.reset}\n`);
+        const warns: string[] = [];
+        if (a3bWarn && !p.a3b_safe) warns.push("⚠ A3B target — eviction unsafe at current R̄ (per feedback memory). Pick `off`.");
+        if (p.ar_only && dflashOn) warns.push("⚠ dflash_mode is ON. m-fold + DFlash has a documented attractor regression. Set dflash_mode=off first.");
+        for (const w of warns) write(`     ${C.yellow}${w}${C.reset}\n`);
+        write("\n");
+      }
+    }
+
+    write(`\n  ${C.dim}↑↓ select · enter apply · esc cancel${C.reset}\n`);
+    if (flash) {
+      write(`\n  ${flash}\n`);
+      flash = "";
+    }
+  };
+
   const render = () => {
+    if (profilePickerOpen) {
+      renderProfilePicker();
+      return;
+    }
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
@@ -2663,8 +3360,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       }
     }
 
-    // Virtual nav rows (global mode only). Shown as a distinct-looking row
-    // the user can Enter into.
+    // Virtual nav rows. Shown as a distinct-looking row the user can Enter into.
     for (let n = 0; n < navKeys.length; n++) {
       const rowIdx = keys.length + n;
       const nk = navKeys[n];
@@ -2679,6 +3375,29 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
         write(`\n${caret} ${C.bold}${label}${C.reset} ${val}  ${C.dim}→ enter to open model picker${C.reset}\n`);
         if (rowIdx === selected) {
           write(`${" ".repeat(3 + labelW)}${C.dim}Per-model overlays let you customize settings for a specific model (e.g. bigger max_seq for long ctx on 9B).${C.reset}\n`);
+        }
+      } else if (nk === "__cask_profile__") {
+        const profileVals = {
+          cask: effective("cask") as boolean,
+          cask_budget: effective("cask_budget") as number,
+          cask_beta: effective("cask_beta") as number,
+          cask_core_frac: effective("cask_core_frac") as number,
+          cask_fold_m: effective("cask_fold_m") as number,
+          cask_sidecar: effective("cask_sidecar") as string,
+          cask_auto_attach: effective("cask_auto_attach") as boolean,
+        };
+        const active = detectCaskProfile(profileVals);
+        const sidecarSet = !!effective("cask_sidecar");
+        const label = "cask profile".padEnd(labelW);
+        const valColor = active === "custom" ? C.yellow : (active === "off" ? C.dim : C.green);
+        const val = `${valColor}${active}${C.reset}`.padEnd(14 + 20);
+        const evictHint = sidecarSet
+          ? `${C.dim}sidecar set → eviction ${effective("cask") ? "(m-fold)" : "(drop)"} active${C.reset}`
+          : `${C.dim}no sidecar — set cask_sidecar to engage${C.reset}`;
+        write(`\n${caret} ${C.bold}${label}${C.reset} ${val}  ${evictHint}\n`);
+        if (rowIdx === selected) {
+          const short = CASK_PROFILES[active]?.short ?? "hand-tuned values; not a preset";
+          write(`${" ".repeat(3 + labelW)}${C.dim}${short} — enter to open profile picker${C.reset}\n`);
         }
       }
     }
@@ -2719,6 +3438,30 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     };
 
     const onData = (data: string) => {
+      if (profilePickerOpen) {
+        // Profile picker modal — Up/Down navigate, Enter applies, Esc cancels.
+        if (data === "\x1b[A") {
+          profilePickerSelected = (profilePickerSelected + profileNames.length - 1) % profileNames.length;
+        } else if (data === "\x1b[B") {
+          profilePickerSelected = (profilePickerSelected + 1) % profileNames.length;
+        } else if (data === "\r" || data === "\n") {
+          const name = profileNames[profilePickerSelected];
+          const p = CASK_PROFILES[name];
+          for (const k of Object.keys(p.apply) as (keyof CaskProfileBundle)[]) {
+            setValue(k, (p.apply as any)[k]);
+          }
+          profilePickerOpen = false;
+          flash = `${C.green}cask profile → ${name}${C.reset}`;
+        } else if (data === "\x1b" || data === "q" || data === "Q") {
+          profilePickerOpen = false;
+          flash = `${C.dim}cancelled${C.reset}`;
+        } else if (data === "\x03") {
+          cleanup();
+          process.exit(130);
+        }
+        render();
+        return;
+      }
       if (editing) {
         // Text/number edit mode
         if (data === "\r" || data === "\n") {
@@ -2786,9 +3529,24 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
           break;
         case "\r": case "\n": {
           if (onNavRow()) {
-            if (currentNavKey() === "__per_model__") {
+            const nk = currentNavKey();
+            if (nk === "__per_model__") {
               saveAndExit("open_picker");
               return;
+            } else if (nk === "__cask_profile__") {
+              const profileVals = {
+                cask: effective("cask") as boolean,
+                cask_budget: effective("cask_budget") as number,
+                cask_beta: effective("cask_beta") as number,
+                cask_core_frac: effective("cask_core_frac") as number,
+                cask_fold_m: effective("cask_fold_m") as number,
+                cask_sidecar: effective("cask_sidecar") as string,
+                cask_auto_attach: effective("cask_auto_attach") as boolean,
+              };
+              const active = detectCaskProfile(profileVals);
+              const idx = profileNames.indexOf(active);
+              profilePickerSelected = idx >= 0 ? idx : 0;
+              profilePickerOpen = true;
             }
             break;
           }
@@ -2982,10 +3740,11 @@ switch (cmd) {
       // Fork a detached child. `setsid` gives it its own session so Ctrl-C
       // in the parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout
       // + stderr go to the log file. HIPFIRE_DETACHED prevents infinite forking.
+      const runBg = process.platform === "win32" ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"]
       const self = process.argv[0];
       const script = process.argv[1];
       const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const child = Bun.spawn(["setsid", "nohup", self, script, "serve", String(port)], {
+      const child = Bun.spawn([...runBg, self, script, "serve", String(port)], {
         stdin: "ignore",
         stdout: logFd,
         stderr: logFd,
@@ -3072,10 +3831,11 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
-    const temp = Number(flags["--temp"] ?? cfg.temperature);
-    const topP = Number(flags["--top-p"] ?? cfg.top_p);
-    const repeatPenalty = Number(flags["--repeat-penalty"] ?? cfg.repeat_penalty);
-    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? cfg.max_tokens));
+    const runCfg = resolveModelConfig(model);
+    const temp = Number(flags["--temp"] ?? runCfg.temperature);
+    const topP = Number(flags["--top-p"] ?? runCfg.top_p);
+    const repeatPenalty = Number(flags["--repeat-penalty"] ?? runCfg.repeat_penalty);
+    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? runCfg.max_tokens));
     if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
     if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
@@ -3083,6 +3843,18 @@ switch (cmd) {
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
     await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    break;
+  }
+  case "chat": {
+    const chatArgs = rest.filter(a => !a.startsWith("--"));
+    const chatFlags = new Set(rest.filter(a => a.startsWith("--")));
+    const chatTag = chatArgs[0];
+    if (!chatTag) {
+      console.error("Usage: hipfire chat <tag> [--no-color]  (e.g. hipfire chat qwen3.5:9b)");
+      process.exit(1);
+    }
+    const { chatTui } = await import("./chat.ts");
+    await chatTui(chatTag, cfg, { noColor: chatFlags.has("--no-color") });
     break;
   }
   case "pull": {
@@ -3584,6 +4356,13 @@ switch (cmd) {
         if (diag.type === "diag") {
           console.log(`  GPU arch:    ${diag.arch}`);
           console.log(`  HIP version: ${diag.hip_version}`);
+          if ((diag.arch === "gfx1150" || diag.arch === "gfx1151") && diag.hip_version) {
+            const [maj, min] = diag.hip_version.split(".").map(Number);
+            if (maj < 7 || (maj === 7 && min < 2)) {
+              console.log(`  WARNING: ${diag.arch} requires ROCm 7.2+. Current: ${diag.hip_version}`);
+              console.log(`           ROCm <7.2 segfaults on hipMalloc for RDNA 3.5.`);
+            }
+          }
           console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
           console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
 
@@ -3827,14 +4606,16 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
   case "config": {
     // `hipfire config`                                  → global TUI
     // `hipfire config list|get|set|reset [...]`          → global scripting
+    // `hipfire config cask-profile <name>`               → bundle setter
     // `hipfire config <model:tag>`                       → per-model TUI
     // `hipfire config <model:tag> list|get|set|reset ...` → per-model scripting
+    // `hipfire config <model:tag> cask-profile <name>`   → per-model bundle setter
     //
     // Disambiguate: first arg is a model tag if it's a known REGISTRY entry
     // (resolved) or matches the `name:tag` shape. Otherwise treat as action.
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
-    if (firstArg && !["list", "get", "set", "reset"].includes(firstArg)) {
+    if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
       // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
       if (REGISTRY[resolved] || firstArg.includes(":")) {
@@ -3994,8 +4775,77 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         saveConfig({ ...CONFIG_DEFAULTS });
         console.log("All config reset to defaults");
       }
+    } else if (action === "cask-profile") {
+      // `hipfire config cask-profile` — print active + list available
+      // `hipfire config cask-profile <name>` — apply bundle to global
+      // `hipfire config <model:tag> cask-profile <name>` — apply to per-model
+      const profileName = key;
+      const effectiveCfg = modelScope ? resolveModelConfig(modelScope) : cfg;
+      const profileVals = {
+        cask: effectiveCfg.cask,
+        cask_budget: effectiveCfg.cask_budget,
+        cask_beta: effectiveCfg.cask_beta,
+        cask_core_frac: effectiveCfg.cask_core_frac,
+        cask_fold_m: effectiveCfg.cask_fold_m,
+        cask_sidecar: effectiveCfg.cask_sidecar,
+        cask_auto_attach: effectiveCfg.cask_auto_attach,
+      };
+      const active = detectCaskProfile(profileVals);
+      if (!profileName) {
+        console.log(`Active CASK profile${modelScope ? ` (${modelScope})` : ""}: ${active}`);
+        console.log(`\nAvailable profiles:`);
+        for (const [n, p] of Object.entries(CASK_PROFILES)) {
+          const marker = n === active ? "▸" : " ";
+          console.log(`  ${marker} ${n.padEnd(18)} ${p.short}`);
+        }
+        console.log(`\nApply: hipfire config${modelScope ? ` ${modelScope}` : ""} cask-profile <name>`);
+        console.log(`Detail: see docs/CONFIG.md "CASK profiles" section.`);
+        break;
+      }
+      if (!CASK_PROFILES[profileName]) {
+        console.error(`Unknown CASK profile: ${profileName}`);
+        console.error(`Available: ${Object.keys(CASK_PROFILES).join(", ")}`);
+        process.exit(1);
+      }
+      const bundle = CASK_PROFILES[profileName].apply;
+      // Safety check: per-model A3B + non-`off` profile is unsafe at current R̄.
+      if (modelScope && tagIsA3B(modelScope) && !CASK_PROFILES[profileName].a3b_safe) {
+        console.error(`⚠ ${modelScope} is an A3B model. Eviction at current R̄≈0.36–0.39 produces`);
+        console.error(`  confident-wrong hallucinations under multi-turn (see feedback memory).`);
+        console.error(`  Refusing to apply '${profileName}'. Safe profiles for A3B: ${Object.entries(CASK_PROFILES).filter(([_, p]) => p.a3b_safe).map(([n]) => n).join(", ")}.`);
+        console.error(`  Override with HIPFIRE_FORCE_A3B_EVICTION=1 (not recommended).`);
+        if (process.env.HIPFIRE_FORCE_A3B_EVICTION !== "1") process.exit(1);
+      }
+      if (modelScope) {
+        for (const k of Object.keys(bundle) as (keyof CaskProfileBundle)[]) {
+          writePerModel(k as PerModelKey, (bundle as any)[k]);
+        }
+        console.log(`${modelScope}: cask-profile → ${profileName}`);
+      } else {
+        for (const k of Object.keys(bundle) as (keyof CaskProfileBundle)[]) {
+          (cfg as any)[k] = (bundle as any)[k];
+        }
+        saveConfig(cfg);
+        console.log(`cask-profile → ${profileName}`);
+      }
+      const sidecarSet = !!effectiveCfg.cask_sidecar;
+      if (!sidecarSet && profileName !== "off" && profileName !== "auto") {
+        console.log(`note: cask_sidecar is not set. The profile is configured, but eviction`);
+        console.log(`      only engages when a sidecar path is loaded. Set with:`);
+        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.bin`);
+      }
+      if (profileName === "auto" && !sidecarSet) {
+        console.log(`note: auto-attach will scan for a sidecar next to the model file at load.`);
+        console.log(`      Pull a model with a published sidecar (e.g. \`hipfire pull qwen3.6:27b\`)`);
+        console.log(`      to engage CASK with no further config.`);
+      }
+      if (CASK_PROFILES[profileName].ar_only && effectiveCfg.dflash_mode !== "off") {
+        console.log(`warn: ${profileName} is AR-only (m-fold + DFlash has documented attractor regression).`);
+        console.log(`      dflash_mode is currently '${effectiveCfg.dflash_mode}'. Recommend:`);
+        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set dflash_mode off`);
+      }
     } else {
-      console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} [list|get|set|reset]`);
+      console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} [list|get|set|reset|cask-profile]`);
     }
     break;
   }

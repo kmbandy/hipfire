@@ -1,5 +1,189 @@
 # Changelog
 
+## v0.1.9-alpha.1 (2026-05-02)
+
+Patch release. Closes #111 — MQ4 single-token attractor on `<tool_call>`
+that left agentic harnesses unable to dispatch tool calls on
+`qwen3.6:27b.mq4` (and any other MQ4-quant Qwen3+ model with structured-
+output drift). Two complementary defenses ship together:
+
+- **Engine (daemon)** — new GPU-side `apply_unclosed_attractor_block`
+  scans the recent decode window for unclosed `<tool_call>` openers
+  (`opens − closes`); when depth ≥ 2, writes a single 4-byte `-INF`
+  to the logits buffer at the opener's token offset before the next
+  `gpu.sample_top_p`. Same gate for `<think>` to head off the
+  thinking-mode boundary corruption the same reporter saw. Cost is
+  zero when not tripped, ~5 µs when tripped — no D2H, no kernel
+  change. The `(opens − closes)` invariant means legitimate multi-
+  tool turns never trip: a complete `<tool_call>...</tool_call>`
+  decrements depth before the next opener arrives.
+
+- **CLI (parser)** — `parseToolCalls` now strips any leading
+  `<tool_call>\s*` repeats from a captured block before JSON parse.
+  Defense-in-depth in case a nested opener does slip through (the
+  engine block fires before the third opener, but the second still
+  ships in the visible stream).
+
+Verified on hardware (gfx1100 / 7900 XTX / ROCm 7.2 / qwen3.6:27b.mq4)
+against the two prompts the reporter posted as still-broken after the
+v0.1.9-alpha defensive parser ship:
+
+```
+Prompt 1: "what files are in this directory?"
+→ tool_calls: [{ name: "bash", arguments: { command: "ls -la" } }]
+
+Prompt 2: "write a file here named test.md with the text test inside"
+→ tool_calls: [{ name: "write", arguments: { path: "test.md", content: "test" } }]
+```
+
+Both `finish_reason: "tool_calls"`. No attractor loop, no nested
+openers, no parser repair signal on stderr. The model emits clean spec
+JSON now that the gate is in place.
+
+Tests: 10 Rust unit tests (`llama::tests`) covering threshold edges,
+window scope, complete-pair-allow, depth-saturate-at-zero. 14 Bun tests
+(`cli/parse_tool_calls.test.ts`) including 4 new for nested-opener
+strip. Coherence-gate green on 6/6 prompts including the existing
+tool-call coverage test.
+
+Still a stopgap on the symptom. The underlying root cause is MQ4
+calibration drift on structured-output token positions; Path C
+calibration retrain (#39) is the proper fix.
+
+## v0.1.9-alpha (2026-05-02)
+
+Headline: **MQ3 is production-ready.** The sub-4-bit Magnum Quant from
+v0.1.8-alpha is now a full first-class citizen alongside MQ4 — K4-unrolled
+decode GEMV, WMMA prefill family, DFlash cross-quant matrix, gfx12 port.
+27B MQ3 fits 128K context in 24 GB where MQ4 OOMs at ~115K. Plus six
+contributor PRs land in the same cycle, two arch bring-ups, and a sweep
+of cache-lifecycle and parser hardening in response to user reports.
+
+### Highlights — MQ3 production push
+
+- **K4-unrolled MQ3 decode GEMV + fused residual** (gfx1100). 9B MQ3
+  decode 114 → 141 tok/s (+24%); 4B and 0.8B see proportional wins. Same
+  pattern as the v0.1.8 K4 unroll on HFQ4: 4 weight reads + 4 X reads
+  hoisted, 4 dequant + accumulate pairs in the body. Kernel matches MQ4
+  decode within 2% on every size despite the 104 vs 136 B/group.
+- **WMMA prefill family for HFQ3** — `gemm_qkvza_hfq3g256_wmma`,
+  `gemm_qkv_hfq3g256_wmma`, `gemm_gate_up_hfq3g256_wmma`,
+  `gemm_hfq3g256_residual_wmma`. Closes the 17× prefill gap that gated
+  ship: 9B MQ3 pp32 962 tok/s, pp128 1527 tok/s. Arch-gated to gfx11
+  wave32 WMMA (`gfx1100/1101/1102/1150/1151`); gfx12 K4 variant landed in
+  this same cycle.
+- **gfx12 (RDNA4) MQ3 WMMA port** — full 4-kernel family ported to
+  `_w32_gfx12` builtin with K4 unroll + half8_t lane-split matching the
+  v0.1.8 HFQ4 work. gfx1201 baseline + speed-baselines committed.
+- **DFlash + MQ3 cross-quant matrix.** MQ3-target ↔ MQ3-draft, MQ3-target
+  ↔ MQ4-draft, MQ4-target ↔ MQ3-draft all validated end-to-end on
+  gfx1100. Refusal logic narrowed: MoE/A3B + MQ3 still refused (no MoE
+  branched WMMA path); dense MQ3 ships. CLI auto-discovery prefers
+  `dirname(target)` first then mq3↔mq4 cross-quant fallback dirs.
+- **27B MQ3 context-fit data** — fits 128K context in 24 GB on gfx1100
+  with `asym3` KV (10.7 GiB weights vs MQ4's 13.4 GiB). The 2.7 GiB
+  saved on weights is the difference between fitting 128K and OOMing
+  at 112K.
+
+### Highlights — contributor PRs
+
+- **PR #118 — Per-weight MMQ auto-dispatch** (@fivetide). HFQ4 prefill
+  routes to the MMQ i8-WMMA path automatically when `batch_size ≥ 256`
+  and arch supports it (`gfx1100/1101/1102/1103/1150/1151/1152`). 9B
+  pp512 +27% (1672 → 2122 tok/s). Default-on; opt out with
+  `HIPFIRE_MMQ=off`. Tri-state config (`off`/`on`/`auto`) exposed in
+  hipfire-tui.
+- **PR #117 — Windows `serve -d` parity** (@fivetide). `hipfire serve`
+  daemon mode wired through PowerShell on Windows; matches the Linux
+  `--detach` UX. Includes `compile-kernels.ps1` (PowerShell port of
+  `compile-kernels.sh`), `install.ps1` parity with daemon precompile,
+  and `hipcc.exe`-first preference for paths with spaces.
+- **PR #103 — Raw-filename → registry-tag** (@fivetide). `hipfire run
+  qwen3.5-9b.mq4 "..."` now resolves the per-model overrides
+  (`max_think_tokens`, `temp`, etc.) the same way as the registry-tag
+  form. Prior behavior silently fell back to global defaults.
+- **PR #91 — gfx12 WMMA K4 K-tile unroll** (@RobinVanCauter). 7
+  `.gfx12.hip` kernels rewritten with `kt += 4` inner loop;
+  `tests/speed-baselines/gfx1201.txt` refreshed; closes #65. Includes
+  `bench-cold.sh` for cold-process N-run distribution capture.
+- **PR #93 — gfx906 / Vega 20 / MI50 bring-up** (@myaple). Family-141
+  rev-detect splits gfx906 from gfx900 in `redline::device`; wave64
+  dispatch list extended to gfx906; `compile-kernels.sh` skips
+  WMMA/dot8 on gfx906; HSA_OVERRIDE + rocminfo fallbacks added. 196/196
+  kernel compiles + 16/16 channel-tests on local MI50.
+- **PR #109 — MQ2 refuse + MQ3 advisory + sweep harness** (mine, Codex
+  follow-ups). MQ2 refused-by-default (severe quality cliff confirmed);
+  MQ3 emits an advisory on sub-9B; sweep harness reproducibility per
+  CLAUDE.md (committed prompts as files with md5 manifest, scratch off
+  /tmp).
+
+### Engine
+
+- **Cache-invalidation lifecycle** (Codex stop-time follow-ups). Three
+  cross-cutting issues fixed:
+  - `Gpu::invalidate_weight_caches()` clears `mmq_screen_cache` and
+    drains `fp16_shadow_cache` on `unload_model`. Previous behavior left
+    pointer-keyed cache hits on freed buffers — silent corruption on
+    next model load if HIP reused the address.
+  - `Gpu::invalidate_graph_state()` calls `graph_destroy +
+    verify_graph_destroy_all + replay_graph_destroy_all` on unload.
+    Captured hipGraphs over freed weight tensors would replay against
+    garbage on the next `forward_scratch_warmed_up` call.
+  - `graph_destroy()` resets `ar_forward_warmed_up = false`. Without
+    this, the next `forward_scratch` would skip the warmup path and try
+    to replay a destroyed graph.
+- **Defensive `parseToolCalls`** (#111 stopgap). Three known
+  malformations now repaired before the OpenAI shape returns: spec form,
+  flat form, and XML-tag corruption. Token-attractor root cause
+  (calibration retrain) deferred to a follow-up release.
+- **Daemon UX hardening**. `Gpu::init()` failures convert from
+  `expect()` panic to a friendly platform-specific checklist via
+  `report_gpu_init_failure()` + `exit(1)`. Bun stack on the CLI side
+  also caught: `Engine.recv()` cleanly `process.exit(code)`s when the
+  daemon early-exits, instead of throwing through a stack trace.
+- **gfx1152 / Strix Halo APU arch gating**. Added to all RDNA 3.5
+  dispatch lists. Does not yet fix #50 (segfault on `--precompile`);
+  awaiting reporter backtrace.
+
+### Tooling
+
+- **`scripts/speed-gate.sh` DPM warmup** (this release). `bench_run`
+  now sets `HIPFIRE_DPM_WARMUP_SECS=3` so `pp32` measurements are
+  reproducible regardless of GPU thermal state. Cold-DPM penalty was
+  ~16% on the 32-token prefill probe; baseline 1240 was implicitly
+  warm-captured and unreproducible across fresh-process runs without
+  this fix.
+
+### Known caveats
+
+- **MQ3 collapses on sub-9B models**. 0.8B and 4B in MQ3 are advisory
+  only — they parse and dispatch but quality drops below MQ4 by a wide
+  margin on real prompts. Matches QuIP# / sub-4-bit literature.
+- **MQ2 is refused by default**. The quantizer requires
+  `--format mq2 --i-know-this-is-broken` to opt in. Lloyd-Max MQ2
+  (qt=19) and Lloyd-Max MQ3 (qt=20) are the path forward; spike
+  shipped this cycle, full PRs to follow.
+- **MQ3 + MoE / A3B is unsupported**. The MQ3 batched path lacks an
+  MoE-branched WMMA kernel; daemon refuses MQ3 weights inside
+  DeltaNetMoe / FullAttnMoe layers at load time.
+- **#111 token-attractor unresolved**. The parser stopgap masks
+  symptoms; calibration retrain is the real fix and lands in a
+  follow-up release.
+- **#50 (gfx1152 segfault)** still open pending reporter data.
+- **#119 (ROCm 7.2 / clang 22 regression on Strix Halo)** filed this
+  cycle; no engine-side fix yet.
+
+### Upgrade
+
+```bash
+hipfire update                      # if installed via curl-bash
+# or
+git pull && cargo install --path crates/engine
+```
+
+Windows: re-run `install.ps1` — daemon.exe + kernel blobs refresh
+automatically.
+
 ## v0.1.8-alpha.2 (2026-04-27)
 
 Released the same day as alpha.1 — a second cycle's worth of contributor PRs and

@@ -57,8 +57,10 @@ cli/CLAUDE.md
 # Training artifacts (draft ckpts, converted hfq, prompt files, logs)
 .dflash-runs/
 artifacts/
-.gm-stop-verified
 .codeinsight
+.codeinsight+research/
+.local-bench-scratch/
+.gm/rs-learn.db
 findings/
 .plugkit-browser-profile/
 .plugkit-browser-profile-*/
@@ -70,3 +72,19 @@ findings/
 .research-cache/
 research/
 .hipfire_kernels.prerebsave/
+
+# Local agent state (gm planning / learning bookkeeping; varies per session)
+.gm/git-block-counter.json
+.gm/rslearn-counter.json
+.gm/turn-state.json
+.gm/needs-gm
+.gm/lastskill
+.gm/no-memorize-this-turn
+.gm/learning-state.md
+.gm/prd-state.json
+.gm/prd.paused.yml
+.gm/trajectory-drafts/
+.gm/ingest-drafts/
+
+# Scratch research bundles (raw PR diffs, model-conversion test artifacts)
+.codeinsight+research/

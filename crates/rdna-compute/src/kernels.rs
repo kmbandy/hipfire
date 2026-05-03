@@ -46,12 +46,16 @@ pub const GEMV_HFQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq8
 /// Block: [f32 scale][f32 zero][192B data] = 200 bytes per 256 weights (0.78 B/w).
 /// Packing: 4 weights per 3 bytes (24 bits = 4×6 bits).
 pub const GEMV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256.hip");
+pub const GEMV_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual.hip");
 
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
 /// Packing: 8 weights per 3 bytes (24 bits = 8×3 bits).
 pub const GEMV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256.hip");
+pub const GEMV_HFQ3G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256.gfx1100.hip");
+pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.hip");
+pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
@@ -90,6 +94,7 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 
 /// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
 /// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
@@ -206,6 +211,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
+// LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for
+// Gate 1 microbench measurement. See
+// docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
@@ -214,6 +223,19 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/sr
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+// HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
+// lane decomposition; only the inner K-tile unpack differs (3-bit
+// cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
+// wrapper that pre-rotates X. gfx11 K2 unroll variant — gfx12 K4 to
+// follow once K2 is validated.
+pub const GEMM_QKVZA_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma.hip");
+pub const GEMM_GATE_UP_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.hip");
+pub const GEMM_QKV_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.hip");
+pub const GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma.gfx12.hip");
+pub const GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.gfx12.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
@@ -360,6 +382,30 @@ pub fn gemv_hfq4g256_residual_for_arch(arch: &str) -> (&'static str, &'static st
             (GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC, "gemv_hfq4g256_residual_rdna3")
         }
         _ => (GEMV_HFQ4G256_RESIDUAL_SRC, "gemv_hfq4g256_residual"),
+    }
+}
+
+/// Returns the HFQ3-G256 GEMV kernel source AND module name for the given arch.
+/// gfx1100/1101/1102 (RDNA3) gets the K4-unrolled 4-accumulator variant that
+/// closes the per-launch perf gap with MQ4. Other archs use the baseline.
+pub fn gemv_hfq3g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ3G256_GFX1100_SRC, "gemv_hfq3g256_rdna3")
+        }
+        _ => (GEMV_HFQ3G256_SRC, "gemv_hfq3g256"),
+    }
+}
+
+/// Same arch dispatch as `gemv_hfq3g256_for_arch` but returns the residual
+/// variant (y[row] += A[row] · x). Used by `weight_gemv_residual` MQ3 arm
+/// to eliminate the alloc+gemv+add+free fallback chain.
+pub fn gemv_hfq3g256_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC, "gemv_hfq3g256_residual_rdna3")
+        }
+        _ => (GEMV_HFQ3G256_RESIDUAL_SRC, "gemv_hfq3g256_residual"),
     }
 }
 

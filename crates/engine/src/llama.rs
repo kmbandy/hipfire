@@ -579,6 +579,24 @@ pub fn weight_gemv(
             };
             gpu.gemv_mq6g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
+        DType::MQ3G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mq3g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
+        DType::MQ2G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mq2g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
         DType::MQ8G256 => {
             gpu.ensure_mq_signs()?;
             gpu.gemv_mq8g256_with_rotate(&w.buf, x, y, w.m, w.k)
@@ -620,7 +638,7 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
-        DType::MQ4G256 | DType::MQ6G256 => {
+        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256 => {
             gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
             Ok(Some(x_rot_scratch))
         }
@@ -654,7 +672,7 @@ pub fn rotate_x_for_mq<'a>(
     x_rot_scratch: &'a GpuTensor,
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
-        DType::MQ4G256 | DType::MQ6G256 => {
+        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256 => {
             gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
             Ok(Some(x_rot_scratch))
         }
@@ -697,6 +715,20 @@ pub fn weight_gemv_prerotated(
                 weight_gemv(gpu, w, x, y)
             }
         }
+        DType::MQ3G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq3g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ2G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq2g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
         DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
         _ => weight_gemv(gpu, w, x, y),
     }
@@ -721,13 +753,20 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
-        DType::HFQ6G256 | DType::MQ6G256 => {
-            // No dedicated residual GEMV for HFQ6 yet — fall through to generic path.
-            let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
-            weight_gemv(gpu, w, x, &tmp)?;
-            gpu.add_inplace_f32(y, &tmp)?;
-            gpu.free_tensor(tmp)?;
-            Ok(())
+        DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::HFQ6G256 => gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::MQ6G256 => {
+            // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
+            // hfq6g256_residual against the rotated activations. Saves one
+            // add_inplace_f32 launch per layer per token vs the generic path.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            gpu.gemv_hfq6g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
@@ -739,9 +778,24 @@ pub fn weight_gemv_residual(
             gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
             gpu.gemv_hfq4g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ3G256 => {
+            // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
+            // hfq3g256_residual against the rotated activations. Saves one
+            // add_inplace_f32 launch per layer per token vs the generic
+            // path. gfx1100 picks the K4-unrolled chip variant (commit
+            // 0003103, 9B MQ3 decode 114 to 141 tok/s).
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            gpu.gemv_hfq3g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         _ => {
             // Fallback: plain weight_gemv into a scratch, then add_inplace.
-            // Allocates a scratch each call — only used for niche dtypes.
+            // Allocates a scratch each call; only used for niche dtypes.
             let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
             weight_gemv(gpu, w, x, &tmp)?;
             gpu.add_inplace_f32(y, &tmp)?;
@@ -773,19 +827,50 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
-    if w_down.gpu_dtype == DType::MQ4G256 {
-        gpu.ensure_mq_signs()?;
-        let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-            dtype: DType::F32,
-        };
-        gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
-        return gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k);
+    match w_down.gpu_dtype {
+        DType::MQ4G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::MQ3G256 => {
+            // Same shape as MQ4: silu(gate)*up rotated through the FWHT into
+            // the shared mq_x_rot scratch, then the fused HFQ3 residual GEMV
+            // does the down projection plus residual add in one launch. Saves
+            // one silu_mul_f32 launch and one add_inplace_f32 launch versus
+            // the four-step generic path.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_hfq3g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::MQ6G256 => {
+            // MQ6 down + residual fusion: same FWHT rotate + fused-residual
+            // pattern as MQ3 / MQ4, dispatched against the HFQ6 kernel.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        _ => {
+            // Non-MQ fallback: plain two-step.
+            gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
+            weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
+        }
     }
-    // Non-MQ fallback: plain two-step.
-    gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
-    weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
 }
 
 /// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
@@ -2440,6 +2525,68 @@ pub fn apply_ngram_block(logits: &mut [f32], history: &[u32]) {
     }
 }
 
+/// Single-token attractor block for special tokens. Counts how many times
+/// `token_id` appears in the last `window` tokens of `history`; if it is
+/// at or above `threshold`, sets that token's logit to `-INF` so the
+/// next sample picks something else. Targets MQ4 single-token attractors
+/// on tokens that have no paired closer (e.g. a runaway emit of a
+/// solo special). For paired open/close tokens like `<tool_call>` /
+/// `</tool_call>`, prefer `apply_unclosed_attractor_block` — it triggers
+/// before the model can stack a second nested opener that breaks
+/// downstream regex parsers (see #111 codex review).
+pub fn apply_special_token_attractor_block(
+    logits: &mut [f32],
+    history: &[u32],
+    token_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if (token_id as usize) >= logits.len() || threshold == 0 || window == 0 {
+        return;
+    }
+    let start = history.len().saturating_sub(window);
+    let count = history[start..].iter().filter(|&&t| t == token_id).count();
+    if count >= threshold {
+        logits[token_id as usize] = f32::NEG_INFINITY;
+    }
+}
+
+/// Open/close-paired attractor block for structured special tokens
+/// (`<tool_call>`/`</tool_call>`, `<think>`/`</think>`).
+///
+/// Counts unclosed openers in the last `window` tokens — `opens - closes`,
+/// floored at zero. When the running depth reaches `threshold`, sets
+/// `open_id`'s logit to `-INF` so the next sample cannot stack another
+/// nested opener. With `threshold = 2`, a second consecutive opener
+/// without an intervening closer is the last one the decoder is allowed
+/// to emit; the third+ are blocked. The downstream regex parser
+/// (`parseToolCalls` in cli/index.ts) tolerates a single nested opener
+/// by stripping the leading repeat before JSON parse.
+///
+/// The depth saturates at 0 from below: a stray closer at the start of
+/// the window doesn't push depth negative and create false-allow.
+pub fn apply_unclosed_attractor_block(
+    logits: &mut [f32],
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if (open_id as usize) >= logits.len() || threshold == 0 || window == 0 {
+        return;
+    }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id { depth += 1; }
+        else if t == close_id && depth > 0 { depth -= 1; }
+    }
+    if depth >= threshold as i32 {
+        logits[open_id as usize] = f32::NEG_INFINITY;
+    }
+}
+
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
@@ -2716,4 +2863,110 @@ fn simple_rand() -> f32 {
     s ^= s << 5;
     SAMPLER_STATE.store(s, Ordering::Relaxed);
     (s as f32) / (u32::MAX as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attractor_block_below_threshold() {
+        // 2 occurrences of token 7 in window=20, threshold=3 → no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![1, 2, 7, 3, 4, 7, 5];
+        apply_special_token_attractor_block(&mut logits, &history, 7, 20, 3);
+        assert!(logits[7].is_finite(), "below threshold should leave logit untouched");
+    }
+
+    #[test]
+    fn attractor_block_at_threshold() {
+        // 3 occurrences of token 5 in last 20 → block fires.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 5, 2, 5];
+        apply_special_token_attractor_block(&mut logits, &history, 5, 20, 3);
+        assert_eq!(logits[5], f32::NEG_INFINITY, "threshold met should -INF the logit");
+    }
+
+    #[test]
+    fn attractor_block_window_scoped() {
+        // 3 occurrences of token 9, but only 1 in the last 5 tokens (window=5,
+        // threshold=3) → no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![9, 9, 1, 2, 3, 4, 5, 9, 6];
+        apply_special_token_attractor_block(&mut logits, &history, 9, 5, 3);
+        assert!(logits[9].is_finite(), "older occurrences must not count");
+    }
+
+    #[test]
+    fn attractor_block_pure_repeat() {
+        // Worst case: model emits the same special token 5x in a row. Block
+        // must fire.
+        let mut logits = vec![0.5f32; 16];
+        let history: Vec<u32> = vec![11, 11, 11, 11, 11];
+        apply_special_token_attractor_block(&mut logits, &history, 11, 20, 3);
+        assert_eq!(logits[11], f32::NEG_INFINITY);
+        // Other logits untouched.
+        assert!((logits[10] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attractor_block_oob_token_is_noop() {
+        let mut logits = vec![1.0f32; 4];
+        let history: Vec<u32> = vec![999, 999, 999];
+        // token_id past vocab size — should not panic, leave logits untouched.
+        apply_special_token_attractor_block(&mut logits, &history, 999, 20, 3);
+        for &v in &logits { assert!(v.is_finite()); }
+    }
+
+    #[test]
+    fn unclosed_block_below_threshold() {
+        // 1 open, 0 closes — depth=1 < threshold=2, no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 2];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert!(logits[5].is_finite());
+    }
+
+    #[test]
+    fn unclosed_block_paired_call_passes() {
+        // Single complete call: <tool_call>{}</tool_call> = open + close.
+        // Depth ends at 0; a follow-up second open would land at 1,
+        // still below threshold=2. Don't block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 2, 6, 5]; // open, body, body, close, open
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert!(logits[5].is_finite(), "second legit open after a complete call must pass");
+    }
+
+    #[test]
+    fn unclosed_block_two_stacked_opens_blocks_third() {
+        // The exact #111 attractor shape: <tool_call><tool_call>...
+        // After two consecutive opens with no close, depth = 2 = threshold,
+        // block fires (preventing the third).
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 5];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert_eq!(logits[5], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn unclosed_block_depth_saturates_at_zero() {
+        // Stray close at start of window must not push depth negative
+        // and let an attractor through. Window: close, open, open.
+        // depth = max(0, -1) + 1 + 1 = 2 → block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![6, 5, 5];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert_eq!(logits[5], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn unclosed_block_window_scoped() {
+        // 2 unclosed opens earlier in history, but the recent window=3 only
+        // sees [body, body, close]. depth = 0, allow.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 5, 1, 2, 6];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 3, 2);
+        assert!(logits[5].is_finite(), "older unclosed opens must not count once they leave the window");
+    }
 }

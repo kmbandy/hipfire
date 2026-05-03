@@ -98,6 +98,74 @@ struct CaskConfig {
 ///
 /// Returns the File handle; caller MUST keep it alive for the process
 /// lifetime (on Unix, dropping it closes the fd and releases the lock).
+/// GPU-side attractor blockers for the AR generate path (#111).
+///
+/// MQ4 quant pressure makes structured-output special tokens (`<tool_call>`,
+/// `<think>`) into self-reinforcing attractors: the model emits the same
+/// special token hundreds of times in a row, never reaching the JSON body
+/// (or in stacked-opener shapes that downstream regex parsers cannot
+/// recover). The CPU-side `apply_ngram_block` is not in this path (its
+/// per-token D2H + H2D would tank decode tok/s) and the GPU sampler's
+/// repeat-penalty alone doesn't break a strong single-token loop fast
+/// enough at the user-validated `RP=1.05` floor.
+///
+/// Both helpers below scan the recent `window` generated tokens
+/// (CPU-side u32 comparisons over ~20 tokens) and, when tripped, write
+/// a single 4-byte `-INF` into the GPU logits buffer at offset
+/// `open_id * 4` via `memcpy_htod_offset`. No D2H, no kernel change,
+/// ~5 µs only on turns that trip; zero cost otherwise.
+///
+/// `gpu_block_attractor_unclosed` is the right call for paired
+/// open/close special tokens (`<tool_call>` / `</tool_call>`,
+/// `<think>` / `</think>`). It blocks the next emission when there
+/// are ≥ `threshold` opens minus closes in the window — i.e. unclosed
+/// nested openers. With `threshold = 2`, the helper trips before the
+/// model can emit a third nested opener; a second opener is still
+/// possible (we can only block the *next* token), but the parser-side
+/// strip in `parseToolCalls` (#111 stopgap) recovers from a single
+/// nested opener.
+///
+/// `gpu_block_attractor_token` is the simpler fallback for unpaired
+/// tokens: trips on `count >= threshold` regardless of structure.
+fn gpu_block_attractor_unclosed(
+    gpu: &rdna_compute::Gpu,
+    logits_buf: &hip_bridge::DeviceBuffer,
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 { return; }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id { depth += 1; }
+        else if t == close_id && depth > 0 { depth -= 1; }
+    }
+    if depth >= threshold as i32 {
+        let bytes: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
+        let _ = gpu.hip.memcpy_htod_offset(logits_buf, (open_id as usize) * 4, &bytes);
+    }
+}
+
+fn gpu_block_attractor_token(
+    gpu: &rdna_compute::Gpu,
+    logits_buf: &hip_bridge::DeviceBuffer,
+    history: &[u32],
+    tok_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 { return; }
+    let start = history.len().saturating_sub(window);
+    let count = history[start..].iter().filter(|&&t| t == tok_id).count();
+    if count >= threshold {
+        let bytes: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
+        let _ = gpu.hip.memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
+    }
+}
+
 fn acquire_daemon_lock() -> std::fs::File {
     use std::io::{Seek, Write};
 
@@ -257,6 +325,37 @@ struct LoadedModel {
     dflash: Option<DflashState>,
 }
 
+/// Print a friendly, user-actionable message when Gpu::init fails. Matches
+/// the panic shape we used to emit (which dumped a Rust backtrace and the
+/// raw HipError debug-format) but turns it into a concrete next-step list.
+/// The most common cause on Windows (#112) is HIP SDK present but no
+/// AMD GPU driver visible to the runtime; on Linux it is usually missing
+/// `libamdhip64.so` or kernel-side amdgpu / kfd not loaded.
+fn report_gpu_init_failure(err: &hip_bridge::HipError) {
+    eprintln!();
+    eprintln!("hipfire: failed to initialize GPU runtime.");
+    eprintln!("  HIP error: {} (code {})", err.message, err.code);
+    eprintln!();
+    if cfg!(target_os = "windows") {
+        eprintln!("  Most common Windows cause: HIP SDK is loaded but no");
+        eprintln!("  AMD GPU is visible to the runtime. Verify:");
+        eprintln!("    1. AMD Adrenalin driver is installed and current.");
+        eprintln!("    2. AMD HIP SDK 6.2 or newer is installed:");
+        eprintln!("       https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html");
+        eprintln!("    3. `amdhip64.dll` is reachable (HIP_PATH set or DLL on PATH).");
+        eprintln!("    4. Reboot after driver / SDK install if you have not yet.");
+    } else {
+        eprintln!("  Most common Linux causes:");
+        eprintln!("    1. amdgpu kernel module not loaded (check `lsmod | grep amdgpu`).");
+        eprintln!("    2. /dev/kfd missing or not readable by the current user");
+        eprintln!("       (add to the `render` group; reboot).");
+        eprintln!("    3. ROCm not installed or libamdhip64.so missing");
+        eprintln!("       (check `ldconfig -p | grep amdhip64`).");
+    }
+    eprintln!();
+    eprintln!("  Run `hipfire diag` for a full environment report.");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -276,11 +375,14 @@ fn main() {
             // Arch is unknown until Gpu::init; use a broad mkdir for the common arches
             // we support so the probe picks one up. The real arch check after init
             // will log the active dir.
-            for arch in ["gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1200", "gfx1201"] {
+            for arch in ["gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1152", "gfx1200", "gfx1201"] {
                 let _ = std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }
-        let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+        let mut gpu = match rdna_compute::Gpu::init() {
+        Ok(g) => g,
+        Err(e) => { report_gpu_init_failure(&e); std::process::exit(1); }
+    };
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
         let mut errors = 0usize;
         for kv in &["asym3", "q8"] {
@@ -305,7 +407,10 @@ fn main() {
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = match rdna_compute::Gpu::init() {
+        Ok(g) => g,
+        Err(e) => { report_gpu_init_failure(&e); std::process::exit(1); }
+    };
     let mut model: Option<LoadedModel> = None;
 
     let stdin = std::io::stdin();
@@ -417,6 +522,16 @@ fn main() {
                     fold_m: cask_fold_m,
                 };
 
+                // MMQ per-weight screening (#87): detect outlier rows that
+                // cause Q8_1 precision loss and fall back to WMMA for those
+                // weights. Enabled by default; disable with mmq_screen=false.
+                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
+                    gpu.mmq_screen = v;
+                }
+                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen_threshold")).and_then(|v| v.as_f64()) {
+                    gpu.mmq_screen_threshold = v as f32;
+                }
+
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
@@ -488,11 +603,28 @@ fn main() {
                 let budget_alert_text = if experimental_ok {
                     msg.get("budget_alert_text").and_then(|v| v.as_str()).unwrap_or("").to_string()
                 } else { String::new() };
+                // Budget for tokens emitted INSIDE the model's <think>...</think>
+                // block. 0 = uncapped (model thinks until it naturally closes).
+                // Triggered from the CLI by per-model `max_think_tokens` config,
+                // OpenAI `chat_template_kwargs.enable_thinking=false` (cap=1),
+                // and `reasoning.effort` (none=1, minimal=64, low=256, medium=
+                // 1024, high=4096, xhigh=0).
+                //
+                // When the cap is reached the daemon force-emits "</think>\n"
+                // through the same KV-write + sample path as a normal token,
+                // closing the thinking block so the model commits to an
+                // answer with the remaining max_tokens budget. Caught by
+                // Codex stop-time review on 2026-04-28: the field had been
+                // shipping in genParams since cli/index.ts but the daemon
+                // was silently ignoring it, making the new reasoning.effort
+                // / enable_thinking knobs no-ops on the wire.
+                let max_think_tokens = msg.get("max_think_tokens")
+                    .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text);
+                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text, max_think_tokens);
                 }
             }
 
@@ -698,6 +830,111 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
 
+    // DFlash speculative-decode requires the target's lm_head to have a
+    // batched-GEMM kernel (used for verify and DDTree top-K). Only
+    // Q8_0 (qt=3) / HFQ4G256 (qt=6) / MQ4G256 (qt=13) are wired into
+    // speculative.rs's `try_batched` predicate (lines 2083-2087,
+    // 2606-2609); every other dtype falls through to a per-row sequential
+    // GEMV path that hangs spec verify (observed: 1 token in 240 s on
+    // 27B MQ3 + dflash-mq4 draft).
+    //
+    // Refuse fast at the HFQ-index level — BEFORE any weight upload, KV
+    // alloc, or scratch alloc — so we don't strand ~12 GB of VRAM in the
+    // pool when the operator passed a draft against an unsupported target.
+    // Read the lm_head tensor's `quant_type` byte directly from the index
+    // (no GPU work). lm_head can be a separate tensor or tied to
+    // embed_tokens, and the tensor names differ by arch:
+    //   - Qwen3.5/3.6 separate: "lm_head.weight" or "model.language_model.lm_head.weight"
+    //   - Qwen3.5/3.6 tied:     "model.language_model.embed_tokens.weight"
+    //   - LLaMA separate:       "lm_head.weight"
+    //   - LLaMA tied:           "model.embed_tokens.weight"
+    // Cover all four; the order mirrors what qwen35::load_weights /
+    // hfq::load_weights_hfq do at runtime, so the qt we read here is the
+    // qt that will end up driving `weights.output.gpu_dtype`.
+    if draft_path.is_some() {
+        let lm_qt = hfq.tensor_data("lm_head.weight")
+            .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+            .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
+            .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+            .map(|(info, _)| info.quant_type);
+        // MQ3 (qt=17) batched lm_head + WMMA prefill kernels exist on gfx11
+        // only (`gemm_hfq3g256_batched_lmhead` + `is_batchable_la` admits MQ3
+        // for gfx1100/1101/1102/1150/1151). On other archs, MQ3 lm_head still
+        // falls through to per-row GEMV that hangs verify. Whitelist:
+        //   - Always: Q8_0=3, HFQ4G256=6, MQ4G256=13
+        //   - gfx11 only: MQ3G256=17
+        // MQ2 (qt=18) is not yet wired into speculative.rs match arms.
+        // MQ3 WMMA family is ported to gfx11 (RDNA3) and gfx12 (RDNA4).
+        // Keep them grouped under the same flag — the builtin name differs
+        // (_w32 vs _w32_gfx12) but the dispatch wrappers route per-arch.
+        let arch_is_gfx11 = matches!(
+            gpu.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            | "gfx1200" | "gfx1201"
+        );
+        let supported = match lm_qt {
+            Some(3 | 6 | 13) => true,
+            Some(17) => arch_is_gfx11,
+            _ => false,
+        };
+        if !supported {
+            let qt_desc = match lm_qt {
+                Some(qt) => format!("quant_type={qt}"),
+                None => "no lm_head/embed_tokens tensor found at any known name".to_string(),
+            };
+            return Err(format!(
+                "DFlash draft requested but target lm_head {} is not \
+                 supported by speculative.rs's batched GEMM paths on this arch \
+                 ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
+                 always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
+                 (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
+                 through to a per-row GEMV that hangs verify. Reload without a \
+                 draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
+                 speculative.rs match arms + add gemm_*_batched_lmhead kernels \
+                 for the remaining dtypes.)",
+                qt_desc, gpu.arch
+            ));
+        }
+
+        // Defense-in-depth: refuse if any body weight is MQ2 (qt=18). MQ3
+        // is now allowed on gfx11 dense (arch_id=5) because the WMMA prefill
+        // family (qkvza/qkv/gate_up/residual hfq3) and
+        // `gemm_hfq3g256_batched_lmhead` are wired. MQ3 is REFUSED on:
+        //   - non-gfx11 archs (no batched WMMA prefill kernels)
+        //   - MoE/A3B targets (arch_id=6) — the MoE LA/FA prefill branches
+        //     and `moe_ffn_all_mq4` predicate are MQ4-only; MQ3 weights
+        //     would silently fall through to HFQ4 kernels with the wrong
+        //     104-vs-136 byte stride. (Future: wire MQ3 into the MoE
+        //     batched branches and the MoE FFN expert kernels.)
+        // MQ2 body still has no batched WMMA kernels anywhere.
+        let arch_is_dense_qwen35 = hfq.arch_id == 5;
+        let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
+        let mq_unsupported = hfq.first_tensor_with_quant_type(18).map(|n| ("MQ2 (qt=18)", n));
+        let mq_unsupported = mq_unsupported.or_else(|| {
+            if !mq3_supported {
+                hfq.first_tensor_with_quant_type(17).map(|n| ("MQ3 (qt=17)", n))
+            } else {
+                None
+            }
+        });
+        if let Some((qt_label, name)) = mq_unsupported {
+            let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
+                format!("arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels", hfq.arch_id)
+            } else {
+                format!("arch={} lacks the corresponding batched WMMA prefill family", gpu.arch)
+            };
+            return Err(format!(
+                "DFlash draft requested but model contains {qt_label} weight \
+                 `{name}` and {arch_reason}. The prefill fast-path falls back \
+                 to per-token `forward_scratch` for every spec verify cycle \
+                 (or worse, a kernel-stride mismatch on MoE) — defeating \
+                 DFlash's speedup. Reload without a draft, or use an MQ4 / \
+                 HFQ4 / Q8 target. (Future: port MQ3/MQ2 to MoE branches and \
+                 additional archs.)"
+            ));
+        }
+    }
+
     // Derive physical_cap. With eviction (cask.sidecar set), the physical
     // buffer only needs to hold budget+beta+safety slots; max_seq is the
     // advertised window the client targets. Without eviction, the two are
@@ -737,6 +974,20 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         };
 
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+
+        // MMQ per-weight screening (#87): pre-screen all weight matrices at
+        // load time so the first prefill doesn't pay the screening overhead.
+        // Results are cached by device pointer in gpu.mmq_screen_cache.
+        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
+            let t0 = std::time::Instant::now();
+            let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
+            let elapsed = t0.elapsed();
+            eprintln!(
+                "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
+                gpu.mmq_screen_threshold, elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+
         // KV cache modes (RotorQuant-style asymmetric: K rotated + V Q8):
         //   asym3 (default) — K at 3-bit rotated, V at Q8_0. 5.5× vs fp32.
         //                     Best quality/compression tradeoff — RotorQuant "planar3".
@@ -871,6 +1122,57 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     }
 }
 
+/// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
+/// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
+fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
+    use engine::qwen35::LayerWeights;
+    let mut n_safe = 0usize;
+    let mut n_unsafe = 0usize;
+
+    for layer in &weights.layers {
+        // Collect all weight tensors for this layer that could use MMQ
+        let wts: Vec<(&engine::llama::WeightTensor, &str)> = match layer {
+            LayerWeights::DeltaNet(l) => vec![
+                (&l.wqkv, "qkvza.qkv"), (&l.wz, "qkvza.z"),
+                (&l.w_beta, "qkvza.beta"), (&l.w_alpha, "qkvza.alpha"),
+                (&l.w_gate, "gate_up.gate"), (&l.w_up, "gate_up.up"),
+                (&l.wo, "residual"),
+            ],
+            LayerWeights::FullAttn(l) => vec![
+                (&l.wq, "qkv.q"), (&l.wk, "qkv.k"), (&l.wv, "qkv.v"),
+                (&l.w_gate, "gate_up.gate"), (&l.w_up, "gate_up.up"),
+                (&l.wo, "residual"),
+            ],
+            LayerWeights::DeltaNetMoe(l) => vec![
+                (&l.wqkv, "qkvza.qkv"), (&l.wz, "qkvza.z"),
+                (&l.w_beta, "qkvza.beta"), (&l.w_alpha, "qkvza.alpha"),
+                (&l.wo, "residual"),
+            ],
+            LayerWeights::FullAttnMoe(l) => vec![
+                (&l.wq, "qkv.q"), (&l.wk, "qkv.k"), (&l.wv, "qkv.v"),
+                (&l.wo, "residual"),
+            ],
+        };
+
+        for (wt, _name) in wts {
+            // MMQ kernels only operate on HFQ4G256 weights. Other formats
+            // (MQ3, MQ2, HFQ6, etc.) use different dispatch paths and must
+            // not be fed to the HFQ4-specific screening kernels — buffer
+            // layout mismatch would read past the end. See PR #106.
+            if !matches!(wt.gpu_dtype, rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256) {
+                continue;
+            }
+            if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
+                n_safe += 1;
+            } else {
+                n_unsafe += 1;
+            }
+        }
+    }
+
+    (n_safe, n_unsafe)
+}
+
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // DFlash state: draft weights have free_gpu; ring / snapshot / tape /
     // verify_scratch don't expose one — their GpuTensors / DeviceBuffers will
@@ -894,6 +1196,18 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    // Drop pointer-keyed caches whose keys point at weight buffers that are
+    // about to be returned to the pool. Without this, the next model loaded
+    // can land at the same device address and silently inherit stale
+    // verdicts (mmq_screen_cache) or leaked FP16 shadows (fp16_shadow_cache).
+    gpu.invalidate_weight_caches();
+    // Tear down any captured hipGraphs (single-slot AR forward graph plus
+    // DFlash verify and replay graph caches). These bake KV-cache, scratch,
+    // and draft-weight pointers into kernarg memory at capture time; the
+    // tensors backing those pointers are freed above, so replaying after
+    // a model swap would dispatch against dangling or wrong-content
+    // memory.
+    gpu.invalidate_graph_state();
     gpu.drain_pool();
 }
 
@@ -1494,11 +1808,24 @@ fn generate_dflash(
     let _ = stdout.flush();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize) {
     // DFlash fast path — only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
     if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
+        if max_think_tokens > 0 {
+            // DFlash's spec-cycle emit path doesn't yet honor max_think_tokens
+            // — wiring close-injection through the verify loop is a separate
+            // change. Tell the operator their cap is being ignored on this
+            // path so they don't think a runaway thinking turn is a daemon
+            // hang. AR path (no draft, or temp>0) does enforce it.
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"max_think_tokens={} ignored on DFlash path (only enforced on AR; set dflash_mode=off to use the AR path with the cap)"}}"#,
+                id, max_think_tokens
+            );
+            let _ = stdout.flush();
+        }
         generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
@@ -1592,6 +1919,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    // Special-token attractor blocking (#111). Resolve the token IDs once;
+    // each pair is `Some` only when the tokenizer registers both opener
+    // and closer as single special tokens (Qwen3+ vocabs). Older vocabs
+    // return `None` and the block is silently skipped — no behavior
+    // change.
+    let tool_call_pair = match (
+        tokenizer.special_token_id("<tool_call>"),
+        tokenizer.special_token_id("</tool_call>"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
+    let think_pair = match (
+        tokenizer.special_token_id("<think>"),
+        tokenizer.special_token_id("</think>"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
@@ -1678,6 +2024,17 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         if !bytes0.is_empty() {
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes0).unwrap();
         }
+        // #111 attractor block: empty `ngram_scope` on first sample (no
+        // generated tokens yet), so the unclosed-depth is always 0 and
+        // this is a no-op here. Still call it for symmetry with the
+        // loop body, in case a future change moves this block into a
+        // multi-step warmup.
+        if let Some((open, close)) = tool_call_pair {
+            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
+        }
+        if let Some((open, close)) = think_pair {
+            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
+        }
         let (tok0, rng0) = gpu.sample_top_p(
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
             vocab_size, temp, top_p, rng_state, scope0.len(), repeat_penalty,
@@ -1693,6 +2050,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut streamed_tokens: Vec<u32> = Vec::new();
         let mut emitted_bytes = 0usize;
         let mut alert_fired = false;
+        // max_think_tokens enforcement state. think_count increments only
+        // while we observe ourselves to be inside a `<think>...</think>`
+        // block via the same decoded-text scan budget_alert uses. When the
+        // cap is hit we splice "</think>\n" into the stream (KV write +
+        // stdout emit + advance generated) so the model finishes thinking
+        // and commits to an answer with the remaining max_tokens budget.
+        // Re-armable: if the model later opens another <think> in the same
+        // turn (rare) the counter resets and the cap re-fires.
+        let mut think_count: usize = 0;
+        let mut prev_in_think: bool = false;
 
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
@@ -1734,6 +2101,71 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if im_end_token == Some(next_token) { break; }
             if tokenizer.is_terminator(next_token) { break; }
 
+            // max_think_tokens enforcement. Track whether we're inside an
+            // open <think>...</think> block and how many tokens we've
+            // emitted there. When the cap is hit, splice "</think>\n" into
+            // the stream (KV write + stdout emit + advance generated) so
+            // the model commits to an answer with the remaining budget.
+            // Same decoded-text scan budget_alert uses; counter is
+            // incremented per-iteration only when we're still inside.
+            if max_think_tokens > 0 {
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let open_idx = raw_str.rfind("<think>");
+                let close_idx = raw_str.rfind("</think>");
+                let in_think = match (open_idx, close_idx) {
+                    (Some(o), Some(c)) => o > c,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if in_think {
+                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
+                } else {
+                    think_count = 0;
+                }
+                prev_in_think = in_think;
+
+                if in_think && think_count >= max_think_tokens {
+                    // Force-close. Encode the close sequence and run each
+                    // token through the KV write + emit path the same way
+                    // a normally-sampled token does. This ensures the
+                    // model's next sample is conditioned on having "said"
+                    // </think>\n itself, instead of seeing a hidden-state
+                    // discontinuity. Respect max_tokens — clip the close
+                    // sequence if not enough room remains and bail.
+                    let close_tokens = tokenizer.encode("</think>\n");
+                    let budget_left = max_tokens.saturating_sub(generated);
+                    let take = close_tokens.len().min(budget_left);
+                    for &t in &close_tokens[..take] {
+                        qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                        m.seq_pos += 1;
+                        if let Some(ref ev) = m.eviction {
+                            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                                m.seq_pos = new_phys;
+                            }
+                        }
+                        m.conversation_tokens.push(t);
+                        streamed_tokens.push(t);
+                        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                        let new_bytes = &all_bytes[emitted_bytes..];
+                        let vl = match std::str::from_utf8(new_bytes) {
+                            Ok(_) => new_bytes.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if vl > 0 {
+                            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                            let _ = stdout.flush();
+                            emitted_bytes += vl;
+                        }
+                        generated += 1;
+                    }
+                    think_count = 0;
+                    prev_in_think = false;
+                    if generated >= max_tokens { break; }
+                }
+            }
+
             // Budget-alert injection: once we hit the configured token count,
             // splice the nudge text into the stream. Tokens are emitted to
             // stdout (so the client sees them) AND forward-fed through the KV
@@ -1769,6 +2201,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
                     if !bytes.is_empty() {
                         gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+                    }
+                    if let Some((open, close)) = tool_call_pair {
+                        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
+                    }
+                    if let Some((open, close)) = think_pair {
+                        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
                     }
                     let (tok, rng) = gpu.sample_top_p(
                         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
@@ -1833,6 +2271,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
             if !bytes.is_empty() {
                 gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+            }
+            // #111 attractor block — see helper docstrings. Counts unclosed
+            // opens in a 20-token window; trips at depth ≥ 2. Cheap when
+            // not tripped, ~5 µs when tripped (single 4-byte H2D into the
+            // logits buffer).
+            if let Some((open, close)) = tool_call_pair {
+                gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
+            }
+            if let Some((open, close)) = think_pair {
+                gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
             }
             // GPU sample: reads scratch.logits (already on GPU), writes token+rng
             // to scratch.sample_buf. Blocks only on the 8-byte D2H readback.
