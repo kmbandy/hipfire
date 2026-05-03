@@ -128,6 +128,23 @@ export interface HipfireConfig {
   // exceeding this fall back to WMMA. Default 0.10 — validated on both
   // qwen3.5-9b and qwen3.6-27b to produce byte-identical output vs WMMA.
   mmq_screen_threshold: number;
+
+  // ── Weight pager (MAD-93/94 v0.2) ────────────────────────────────────
+  // Stream model weights from disk on demand instead of fully resident in
+  // VRAM. Useful for running larger models than VRAM nominally fits.
+  // Currently OFF by default — v0.2 is sync H2D per layer (~0.2 tok/s on
+  // 27B dense) so paging is only worthwhile when the alternative is OOM.
+  // v0.3 adds pinned-RAM tier + async streams for usable speeds.
+  //
+  // `paged_experts`: page MoE experts on demand (A3B-class targets only).
+  // `paged_dense`:   page dense FFN gate/up/down via shared scratch
+  //                  buffers (Qwen3.5/3.6 dense targets only).
+  // `vram_budget_mb`: cap pager VRAM at N MB. 0 = no cap (no eviction).
+  //                   Set below model size to exercise eviction; on
+  //                   small-VRAM cards set near the FFN-budget headroom.
+  paged_experts: boolean;
+  paged_dense: boolean;
+  vram_budget_mb: number;
 }
 
 // Detect GPU at import time for smart defaults
@@ -173,6 +190,9 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // corruption); set `on` to force the sweep.
   mmq_screen: "auto",
   mmq_screen_threshold: 0.10,
+  paged_experts: false,
+  paged_dense: false,
+  vram_budget_mb: 0,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -203,6 +223,9 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prompt_normalize": return typeof value === "boolean";
     case "mmq_screen": return ["off", "on", "auto"].includes(value);
     case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
+    case "paged_experts": return typeof value === "boolean";
+    case "paged_dense": return typeof value === "boolean";
+    case "vram_budget_mb": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1048576;
     default: return false;
   }
 }
@@ -254,6 +277,7 @@ const PER_MODEL_KEYS = [
   "cask_auto_attach",
   "prompt_normalize",
   "mmq_screen", "mmq_screen_threshold",
+  "paged_experts", "paged_dense", "vram_budget_mb",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -743,6 +767,28 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
     process.env.HIPFIRE_DFLASH_NGRAM_BLOCK = "1";
   } else {
     delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
+  }
+  // Weight pager opt-ins (MAD-93/94 v0.2). Daemon ignores these unless
+  // the model arch matches (paged_experts → MoE only, paged_dense →
+  // dense only). Set explicit flag only when ON; daemon treats unset as
+  // OFF (zero overhead, fully resident weights).
+  if (cfg.paged_experts) {
+    process.env.HIPFIRE_PAGED_EXPERTS = "1";
+  } else {
+    delete process.env.HIPFIRE_PAGED_EXPERTS;
+  }
+  if (cfg.paged_dense) {
+    process.env.HIPFIRE_PAGED_DENSE = "1";
+  } else {
+    delete process.env.HIPFIRE_PAGED_DENSE;
+  }
+  // 0 = no cap (engine default = unlimited, no eviction). Only set the
+  // env var when the user picked a real budget so the daemon's
+  // unset-means-unlimited path stays the canonical default.
+  if (cfg.vram_budget_mb > 0) {
+    process.env.HIPFIRE_VRAM_BUDGET_MB = String(cfg.vram_budget_mb);
+  } else {
+    delete process.env.HIPFIRE_VRAM_BUDGET_MB;
   }
 }
 

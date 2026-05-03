@@ -955,7 +955,42 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
 
     if hfq.arch_id == 5 || hfq.arch_id == 6 {
         // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B)
-        let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
+        let mut config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
+
+        // Weight pager opt-ins. Default off — paging is slow without
+        // compute/transfer overlap (v0.2 is sync H2D per layer ≈ 0.2 tok/s
+        // on 27B), useful only when the model wouldn't otherwise fit. v0.3
+        // adds the pinned-RAM tier + async streams for usable speeds.
+        //
+        //   HIPFIRE_PAGED_EXPERTS=1  — page MoE experts (arch=6 only)
+        //   HIPFIRE_PAGED_DENSE=1    — page dense FFN gate/up/down (arch=5 only)
+        //   HIPFIRE_VRAM_BUDGET_MB=N — cap pager VRAM at N MB (0/unset = no cap)
+        if std::env::var("HIPFIRE_PAGED_EXPERTS").ok().as_deref() == Some("1") {
+            if config.num_experts > 0 {
+                config.paged_experts = true;
+                eprintln!("  paged_experts: ON (MoE)");
+            } else {
+                eprintln!("  paged_experts: requested but model is dense (num_experts=0) — ignored");
+            }
+        }
+        if std::env::var("HIPFIRE_PAGED_DENSE").ok().as_deref() == Some("1") {
+            if config.num_experts == 0 {
+                config.paged_dense = true;
+                eprintln!("  paged_dense: ON (dense FFN scratch)");
+            } else {
+                eprintln!("  paged_dense: requested but model is MoE (num_experts={}) — ignored", config.num_experts);
+            }
+        }
+        if let Ok(s) = std::env::var("HIPFIRE_VRAM_BUDGET_MB") {
+            match s.parse::<u64>() {
+                Ok(0) => {} // explicit 0 = unlimited (default)
+                Ok(mb) => {
+                    config.vram_budget_bytes = mb * 1024 * 1024;
+                    eprintln!("  pager VRAM budget: {mb} MB");
+                }
+                Err(_) => eprintln!("  HIPFIRE_VRAM_BUDGET_MB={s:?} not a u64 — ignored"),
+            }
+        }
 
         // Detect VL model: check if vision config AND vision tensors are present
         // Text-only models may have vision config in metadata but no actual vision weights
