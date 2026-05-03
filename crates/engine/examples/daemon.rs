@@ -991,6 +991,19 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 Err(_) => eprintln!("  HIPFIRE_VRAM_BUDGET_MB={s:?} not a u64 — ignored"),
             }
         }
+        // v0.3 host (pinned-RAM) tier. Set above the model's paged-weight
+        // footprint to make the host tier permanent (no host eviction);
+        // every page-in becomes a fast PCIe copy instead of an NVMe read.
+        if let Ok(s) = std::env::var("HIPFIRE_HOST_BUDGET_MB") {
+            match s.parse::<u64>() {
+                Ok(0) => {}
+                Ok(mb) => {
+                    config.host_budget_bytes = mb * 1024 * 1024;
+                    eprintln!("  pager host (pinned-RAM) budget: {mb} MB");
+                }
+                Err(_) => eprintln!("  HIPFIRE_HOST_BUDGET_MB={s:?} not a u64 — ignored"),
+            }
+        }
 
         // Detect VL model: check if vision config AND vision tensors are present
         // Text-only models may have vision config in metadata but no actual vision weights

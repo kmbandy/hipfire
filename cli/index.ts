@@ -145,6 +145,16 @@ export interface HipfireConfig {
   paged_experts: boolean;
   paged_dense: boolean;
   vram_budget_mb: number;
+
+  // ── Pager host tier (v0.3) ───────────────────────────────────────────
+  // Cap pinned-host RAM the pager may hold for a paged-weight shadow
+  // cache. When set above the paged-weight footprint, every cold load
+  // happens once at warmup and every subsequent VRAM page-in is a fast
+  // PCIe copy (~25 GB/s) instead of an NVMe read (~5 GB/s).
+  // 0 = host tier disabled (v0.2 behavior — every cold load re-reads
+  // from NVMe). Only meaningful when paged_experts or paged_dense is
+  // also true.
+  host_budget_mb: number;
 }
 
 // Detect GPU at import time for smart defaults
@@ -193,6 +203,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   paged_experts: false,
   paged_dense: false,
   vram_budget_mb: 0,
+  host_budget_mb: 0,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -226,6 +237,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "paged_experts": return typeof value === "boolean";
     case "paged_dense": return typeof value === "boolean";
     case "vram_budget_mb": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1048576;
+    case "host_budget_mb": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 4194304;
     default: return false;
   }
 }
@@ -277,7 +289,7 @@ const PER_MODEL_KEYS = [
   "cask_auto_attach",
   "prompt_normalize",
   "mmq_screen", "mmq_screen_threshold",
-  "paged_experts", "paged_dense", "vram_budget_mb",
+  "paged_experts", "paged_dense", "vram_budget_mb", "host_budget_mb",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -789,6 +801,13 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
     process.env.HIPFIRE_VRAM_BUDGET_MB = String(cfg.vram_budget_mb);
   } else {
     delete process.env.HIPFIRE_VRAM_BUDGET_MB;
+  }
+  // Pager host tier (v0.3). Only set when > 0 — daemon treats unset as
+  // 0 = tier disabled (v0.2 behavior).
+  if (cfg.host_budget_mb > 0) {
+    process.env.HIPFIRE_HOST_BUDGET_MB = String(cfg.host_budget_mb);
+  } else {
+    delete process.env.HIPFIRE_HOST_BUDGET_MB;
   }
 }
 
