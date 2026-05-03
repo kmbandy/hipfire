@@ -17,5 +17,9 @@ pub mod ddtree;
 pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod cask;
+#[cfg(feature = "deltanet")]
+pub mod cpu_router;
+#[cfg(feature = "deltanet")]
+pub mod weight_pager;
 pub mod image;
 pub mod tokenizer;

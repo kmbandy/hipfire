@@ -109,6 +109,16 @@ pub struct Qwen35Config {
 
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
+
+    // ── Weight pager (MAD-93 v0.1) ───────────────────────────────────
+    /// If true, MoE expert weights are managed by [`crate::weight_pager::WeightPager`]
+    /// and only the active top-k experts per layer are guaranteed resident in
+    /// VRAM. Default false (all experts resident, today's behavior).
+    ///
+    /// Off-switch for the v0.1 PR: when false there is no behavior change
+    /// vs main; when true the forward path takes the paged code path which
+    /// uses a CPU-side router replica + on-demand H2D transfers.
+    pub paged_experts: bool,
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
@@ -171,6 +181,9 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         hidden_dim, layer_types,
         num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
         norm_topk_prob,
+        // MAD-93 v0.1: defaults off; runtime opts in (e.g. via CLI flag in
+        // a follow-up commit). When false, no behavior change vs main.
+        paged_experts: false,
     })
 }
 
