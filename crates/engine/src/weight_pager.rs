@@ -434,6 +434,14 @@ impl WeightPager {
             .get(&id)
             .ok_or(WeightPagerError::NotRegistered(id))?;
         let need = range.len as u64;
+        // Hard cap: a single weight that exceeds `vram_budget_bytes` can't
+        // fit no matter how much we evict. Reject up front rather than
+        // dutifully draining the residency map and then fetching anyway —
+        // that path used to silently violate the budget because
+        // `evict_lru_until` interpreted `need > budget` as "free everything"
+        // and stopped, allowing the subsequent fetch to push usage past the
+        // cap.
+        self.would_fit(need)?;
         // Evict if cold-loading `id` would exceed budget. Skip when budget is
         // u64::MAX (the unlimited / testing default — saves the LRU walk).
         if self.config.vram_budget_bytes != u64::MAX
@@ -501,7 +509,10 @@ impl WeightPager {
     /// Evict residents from the LRU front (least-recently-used) until at
     /// least `need_bytes` would fit under the budget. Returns
     /// [`WeightPagerError::BudgetExhausted`] if nothing more can be evicted
-    /// but space is still insufficient.
+    /// but space is still insufficient, OR if `need_bytes > budget` and
+    /// the budget is finite (no amount of eviction can fit the requested
+    /// weight in that case, and the prior implementation silently drained
+    /// the residency map and let the caller violate the cap anyway).
     ///
     /// Frees evicted tensors via `gpu.free_tensor` — the underlying VRAM
     /// returns to the rdna-compute allocator pool, available for the next
@@ -511,6 +522,10 @@ impl WeightPager {
         need_bytes: u64,
         gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
+        // Reject up front when the requested weight is alone bigger than
+        // the budget. Without this guard, `target_used` saturates to 0 and
+        // the loop drains the residency map without erroring.
+        self.would_fit(need_bytes)?;
         let budget = self.config.vram_budget_bytes;
         // How much we need to free so that vram_used + need <= budget.
         let target_used = budget.saturating_sub(need_bytes);
@@ -534,6 +549,12 @@ impl WeightPager {
                         self.vram_used_bytes
                     );
                 }
+            } else {
+                // LRU and residency map are out of sync — caller pushed onto
+                // LRU without inserting into `resident`, or removed without
+                // updating LRU. In release this is a silent drop; debug
+                // builds catch the invariant violation.
+                debug_assert!(false, "weight_pager: LRU contained {id:?} but residency map did not");
             }
         }
         Ok(())
@@ -586,6 +607,22 @@ impl WeightPager {
     /// Number of currently-resident weights.
     pub fn resident_count(&self) -> usize {
         self.resident.len()
+    }
+
+    /// Pre-flight budget check. Returns Err if a fetch of `need` bytes
+    /// could not fit even with full eviction. Used by `ensure_resident`
+    /// and `evict_lru_until`; exposed so unit tests can exercise the
+    /// invariant without constructing a real Gpu.
+    pub fn would_fit(&self, need: u64) -> Result<(), WeightPagerError> {
+        let budget = self.config.vram_budget_bytes;
+        if budget != u64::MAX && need > budget {
+            return Err(WeightPagerError::BudgetExhausted {
+                need_bytes: need,
+                in_use: self.vram_used_bytes,
+                budget,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -712,6 +749,49 @@ mod tests {
         assert!(!pager.is_resident(id));
         assert!(pager.get(id).is_none());
         // ensure_resident requires a real Gpu — exercised in integration tests.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: a need bigger than the entire budget must NOT cause
+    /// `evict_lru_until` to silently drain the residency map and return Ok.
+    /// Prior to this guard, `target_used = budget.saturating_sub(need)` was 0
+    /// and the loop exited cleanly even though the subsequent fetch in
+    /// `ensure_resident` would push usage past the cap.
+    #[test]
+    fn would_fit_rejects_need_bigger_than_budget() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-budget-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let pager = WeightPager::with_pread_transport(
+            &path,
+            PagerConfig { vram_budget_bytes: 100, trace: false },
+        )
+        .unwrap();
+        // need <= budget → ok
+        assert!(pager.would_fit(50).is_ok());
+        assert!(pager.would_fit(100).is_ok());
+        // need > budget → BudgetExhausted, even on an empty pager
+        match pager.would_fit(1000) {
+            Err(WeightPagerError::BudgetExhausted { need_bytes, in_use, budget }) => {
+                assert_eq!(need_bytes, 1000);
+                assert_eq!(in_use, 0);
+                assert_eq!(budget, 100);
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sanity: with the unlimited budget (default), would_fit accepts
+    /// arbitrary sizes — the cap is a no-op in that mode.
+    #[test]
+    fn would_fit_accepts_anything_when_budget_unlimited() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-unlim-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        // Default is u64::MAX; even u64::MAX - 1 fits.
+        assert!(pager.would_fit(u64::MAX - 1).is_ok());
         let _ = std::fs::remove_file(&path);
     }
 }
