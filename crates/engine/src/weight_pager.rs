@@ -346,6 +346,24 @@ pub struct ByteRange {
     pub len: usize,
 }
 
+/// Uniform-shape MoE expert metadata for v0.1.
+///
+/// Qwen3.5-MoE-A3B has 256 experts that all share the same gate_up and down
+/// shape, so we store one set of dimensions per layer instead of per-expert.
+/// When we add a heterogeneous-shape MoE arch (Mixtral derivatives, etc.),
+/// this generalizes to `Vec<ExpertShape>` indexed by expert index.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertShape {
+    /// Output rows of the fused gate_up matrix = `2 * moe_intermediate_size`.
+    pub gate_up_m: usize,
+    /// Input cols of gate_up = `hidden_size`.
+    pub gate_up_k: usize,
+    /// Output rows of down = `hidden_size`.
+    pub down_m: usize,
+    /// Input cols of down = `moe_intermediate_size`.
+    pub down_k: usize,
+}
+
 struct Resident {
     /// The actual VRAM tensor (pager owns its lifecycle). `dtype: Raw` —
     /// callers reinterpret the bytes via their own `WeightTensor` wrapper at
@@ -399,9 +417,9 @@ impl WeightPager {
     /// Behavior:
     /// - Already resident → mark recently-used, return Ok.
     /// - Not registered (loader bug) → `NotRegistered` error, no GPU work.
-    /// - Cold (registered but not resident) → fetch via transport, allocate
-    ///   VRAM, populate, track residency. **No eviction yet** — task #9 adds
-    ///   the over-budget check that triggers `evict_lru_until` before fetch.
+    /// - Cold (registered but not resident) → if adding `id` would exceed
+    ///   `config.vram_budget_bytes`, evict LRU residents until enough room.
+    ///   Then fetch via transport, populate, track residency.
     pub fn ensure_resident(
         &mut self,
         id: WeightId,
@@ -415,13 +433,17 @@ impl WeightPager {
             .catalog
             .get(&id)
             .ok_or(WeightPagerError::NotRegistered(id))?;
-        // v0.1: no eviction. Once task #9 lands, we'll do:
-        //   if self.vram_used_bytes + range.len > config.vram_budget_bytes {
-        //       self.evict_lru_until(range.len)?;
-        //   }
+        let need = range.len as u64;
+        // Evict if cold-loading `id` would exceed budget. Skip when budget is
+        // u64::MAX (the unlimited / testing default — saves the LRU walk).
+        if self.config.vram_budget_bytes != u64::MAX
+            && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
+        {
+            self.evict_lru_until(need, gpu)?;
+        }
         let (tensor, _handle) = self.transport.fetch(range.offset, range.len, gpu)?;
-        self.vram_used_bytes = self.vram_used_bytes.saturating_add(range.len as u64);
-        self.resident.insert(id, Resident { tensor, bytes: range.len as u64 });
+        self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
+        self.resident.insert(id, Resident { tensor, bytes: need });
         self.lru.push_back(id);
         if self.config.trace {
             eprintln!(
@@ -432,6 +454,100 @@ impl WeightPager {
             );
         }
         Ok(())
+    }
+
+    /// Patch the device-side `expert_*_ptrs` indirection table so the indexed
+    /// MoE GEMV kernels read the currently-resident buffer pointers for the
+    /// active experts in `top_indices` for `layer`.
+    ///
+    /// The ptr tables are laid out as `[num_experts × u64]` (8-byte device
+    /// pointers per expert slot). For each `idx` in `top_indices`, we write
+    /// the GPU pointer of that expert's resident gate_up buffer into
+    /// `gate_up_ptrs.buf[idx * 8 .. idx * 8 + 8]`, same for down_ptrs.
+    ///
+    /// Caller must have already called `ensure_resident` for both
+    /// `WeightId::Expert{layer, expert: idx, role: GateUp}` and
+    /// `WeightId::Expert{layer, expert: idx, role: Down}` for every idx in
+    /// `top_indices` — this method asserts that and panics on miss (loader bug).
+    pub fn patch_expert_ptr_table(
+        &self,
+        layer: u16,
+        top_indices: &[u16],
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        for &idx in top_indices {
+            let gate_up_id = WeightId::Expert { layer, expert: idx, role: ExpertRole::GateUp };
+            let down_id = WeightId::Expert { layer, expert: idx, role: ExpertRole::Down };
+            let gate_up_tensor = self
+                .resident
+                .get(&gate_up_id)
+                .unwrap_or_else(|| panic!("patch_expert_ptr_table: {gate_up_id:?} not resident"));
+            let down_tensor = self
+                .resident
+                .get(&down_id)
+                .unwrap_or_else(|| panic!("patch_expert_ptr_table: {down_id:?} not resident"));
+            // u64 pointer values, written into the device table at expert idx's slot.
+            let gate_up_ptr = gate_up_tensor.tensor.buf.as_ptr() as u64;
+            let down_ptr = down_tensor.tensor.buf.as_ptr() as u64;
+            let offset = (idx as usize) * 8;
+            gpu.hip.memcpy_htod_offset(&gate_up_ptrs.buf, offset, &gate_up_ptr.to_le_bytes())?;
+            gpu.hip.memcpy_htod_offset(&down_ptrs.buf, offset, &down_ptr.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Evict residents from the LRU front (least-recently-used) until at
+    /// least `need_bytes` would fit under the budget. Returns
+    /// [`WeightPagerError::BudgetExhausted`] if nothing more can be evicted
+    /// but space is still insufficient.
+    ///
+    /// Frees evicted tensors via `gpu.free_tensor` — the underlying VRAM
+    /// returns to the rdna-compute allocator pool, available for the next
+    /// `transport.fetch`.
+    pub fn evict_lru_until(
+        &mut self,
+        need_bytes: u64,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        let budget = self.config.vram_budget_bytes;
+        // How much we need to free so that vram_used + need <= budget.
+        let target_used = budget.saturating_sub(need_bytes);
+        while self.vram_used_bytes > target_used {
+            let id = self
+                .lru
+                .pop_front()
+                .ok_or(WeightPagerError::BudgetExhausted {
+                    need_bytes,
+                    in_use: self.vram_used_bytes,
+                    budget,
+                })?;
+            if let Some(r) = self.resident.remove(&id) {
+                self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
+                let _ = gpu.free_tensor(r.tensor);
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] evict {id:?} ({} bytes) — {} resident, {} used",
+                        r.bytes,
+                        self.resident.len(),
+                        self.vram_used_bytes
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Free all resident tensors back to the GPU pool. Called on model
+    /// teardown so VRAM goes back to the system. After this, the pager is
+    /// effectively reset (catalog stays, residency map is empty).
+    pub fn free_all(&mut self, gpu: &mut Gpu) {
+        for (_id, r) in self.resident.drain() {
+            let _ = gpu.free_tensor(r.tensor);
+        }
+        self.lru.clear();
+        self.vram_used_bytes = 0;
     }
 
     /// Get the resident tensor for `id`. Returns `None` if not resident
@@ -462,33 +578,14 @@ impl WeightPager {
         }
     }
 
-    /// Evict resident weights starting from the LRU tail until the freed
-    /// bytes meet `need_bytes`. v0.1 stub — real eviction lands in task #9.
-    pub fn evict_lru_until(&mut self, _need_bytes: u64) -> Result<(), WeightPagerError> {
-        Err(WeightPagerError::Unimplemented(
-            "LRU eviction lands in task #9",
-        ))
-    }
-
     /// Bytes currently held resident. Cheap (cached, not a sum).
     pub fn vram_used_bytes(&self) -> u64 {
         self.vram_used_bytes
     }
 
-    /// Patch the device-side `expert_*_ptrs` indirection table so the indexed
-    /// MoE GEMV reads the currently-resident buffer pointers for `layer`.
-    ///
-    /// v0.1 stub — wired in task #8 when `moe_ffn_decode_impl` learns the
-    /// paged path. The shape is here so the call site is locked in: pager
-    /// patches the tables, kernels read from them.
-    pub fn update_expert_ptrs(
-        &mut self,
-        _layer: u16,
-        _gate_up_ptrs: &GpuTensor,
-        _down_ptrs: &GpuTensor,
-        _gpu: &mut Gpu,
-    ) -> HipResult<()> {
-        Ok(())
+    /// Number of currently-resident weights.
+    pub fn resident_count(&self) -> usize {
+        self.resident.len()
     }
 }
 
@@ -502,7 +599,15 @@ pub enum WeightPagerError {
     NotRegistered(WeightId),
     /// Hipfire HIP error (transfer / alloc failed).
     Hip(hip_bridge::HipError),
-    /// Stub for unimplemented paths in this skeleton commit.
+    /// Eviction couldn't free enough room — budget too small for the
+    /// requested weight. User needs to raise `vram_budget_bytes` or
+    /// reduce the working set somehow.
+    BudgetExhausted {
+        need_bytes: u64,
+        in_use: u64,
+        budget: u64,
+    },
+    /// Stub for paths still being filled in.
     Unimplemented(&'static str),
 }
 
@@ -511,6 +616,12 @@ impl std::fmt::Display for WeightPagerError {
         match self {
             Self::NotRegistered(id) => write!(f, "weight not registered: {id:?}"),
             Self::Hip(e) => write!(f, "hip error: {e}"),
+            Self::BudgetExhausted { need_bytes, in_use, budget } => write!(
+                f,
+                "weight pager: cannot evict to fit {need_bytes} bytes \
+                 (in_use={in_use}, budget={budget}); raise vram_budget_bytes \
+                 or reduce paged working set"
+            ),
             Self::Unimplemented(why) => write!(f, "weight pager: unimplemented ({why})"),
         }
     }
