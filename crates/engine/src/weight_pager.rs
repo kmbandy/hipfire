@@ -72,6 +72,11 @@ pub enum WeightId {
     Router { layer: u16 },
     /// Dense attention weight (q/k/v/o).
     DenseAttn { layer: u16, role: AttnRole },
+    /// Dense FFN weight (gate / up / down). The big-three for paged dense
+    /// inference — Qwen3.6-27B's per-layer FFN is ~140 MB at MQ4 (across
+    /// all three roles), 64 layers ≈ 9 GB. Paging unlocks 27B Q4 on 16 GB
+    /// GPUs (MAD-94 v0.2).
+    DenseFfn { layer: u16, role: FfnRole },
     /// RMSNorm gain vector. Tiny but per-layer.
     Norm { layer: u16, kind: NormKind },
     /// Token embedding table (always resident in v0.1).
@@ -105,6 +110,18 @@ pub enum AttnRole {
     O,
     /// Fused QKV when the model stores them as one tensor.
     Qkv,
+}
+
+/// Dense FFN weight role. The standard transformer FFN is
+/// `down(silu(gate) * up)` over `[hidden]→[intermediate]→[hidden]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FfnRole {
+    /// Gate projection: `[intermediate, hidden]`.
+    Gate,
+    /// Up projection: `[intermediate, hidden]`.
+    Up,
+    /// Down projection: `[hidden, intermediate]`.
+    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,6 +169,19 @@ pub trait Transport: Send {
         len: usize,
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)>;
+
+    /// Copy `len` bytes from `hfq_offset` into the **existing** device
+    /// buffer `dst`. Used by the scratch-buffer paging pattern (dense
+    /// paging) where one fixed-size buffer is reused across layers
+    /// rather than allocating a fresh one per page-in. Caller guarantees
+    /// `dst.buf.size >= len`.
+    fn fill_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<()>;
 
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
@@ -276,8 +306,28 @@ impl Transport for PreadH2DTransport {
         Ok((tensor, self.next_handle()))
     }
 
+    fn fill_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        // pread → staging, then memcpy_htod into the caller's existing buffer.
+        // Used for dense paging where we have one set of scratch buffers
+        // (gate/up/down) reused across layers — alloc-once, fill-many.
+        self.pread_into_staging(hfq_offset, len)
+            .map_err(|e| {
+                hip_bridge::HipError::new(0, &format!(
+                    "pread {} bytes at offset {} (fill_into): {}",
+                    len, hfq_offset, e
+                ))
+            })?;
+        gpu.hip.memcpy_htod(&dst.buf, &self.staging[..len])
+    }
+
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
-        // Transfers complete synchronously inside `fetch` in v0.1.
+        // Transfers complete synchronously inside `fetch`/`fill_into` in v0.1.
         Ok(())
     }
 }
@@ -558,6 +608,29 @@ impl WeightPager {
     /// (caller should `ensure_resident` first). Does not affect LRU.
     pub fn get(&self, id: WeightId) -> Option<&GpuTensor> {
         self.resident.get(&id).map(|r| &r.tensor)
+    }
+
+    /// Fill an existing device buffer `dst` with the bytes for `id`. Used
+    /// by the scratch-buffer paging pattern (dense FFN paging) where one
+    /// fixed-size scratch tensor is reused across layers — the pager
+    /// rewrites the underlying memory each time the active layer changes
+    /// rather than allocating fresh GpuTensors.
+    ///
+    /// Doesn't update the residency map (no entry is created — the
+    /// scratch buffer is owned by the caller, not the pager). Doesn't
+    /// participate in LRU.
+    pub fn fill_into(
+        &mut self,
+        id: WeightId,
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        let range = *self
+            .catalog
+            .get(&id)
+            .ok_or(WeightPagerError::NotRegistered(id))?;
+        self.transport.fill_into(range.offset, range.len, dst, gpu)?;
+        Ok(())
     }
 
     /// Insert an already-resident weight. Used by the loader for
