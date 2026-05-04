@@ -124,6 +124,7 @@ pub struct HipRuntime {
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
+    fn_stream_create_with_flags: unsafe extern "C" fn(*mut HipStream, c_uint) -> u32,
     fn_stream_synchronize: unsafe extern "C" fn(HipStream) -> u32,
     fn_stream_destroy: unsafe extern "C" fn(HipStream) -> u32,
 
@@ -263,6 +264,7 @@ impl HipRuntime {
                 fn_memset: load_fn!(lib, "hipMemset", unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32),
                 fn_memset_async: load_fn!(lib, "hipMemsetAsync", unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32),
                 fn_stream_create: load_fn!(lib, "hipStreamCreate", unsafe extern "C" fn(*mut HipStream) -> u32),
+                fn_stream_create_with_flags: load_fn!(lib, "hipStreamCreateWithFlags", unsafe extern "C" fn(*mut HipStream, c_uint) -> u32),
                 fn_stream_synchronize: load_fn!(lib, "hipStreamSynchronize", unsafe extern "C" fn(HipStream) -> u32),
                 fn_stream_destroy: load_fn!(lib, "hipStreamDestroy", unsafe extern "C" fn(HipStream) -> u32),
                 fn_module_load: load_fn!(lib, "hipModuleLoad", unsafe extern "C" fn(*mut HipModule, *const c_char) -> u32),
@@ -355,18 +357,22 @@ impl HipRuntime {
     /// GB/s on PCIe 4.0) without bouncing through a kernel staging
     /// buffer. The basis for the WeightPager v0.3 host tier.
     ///
-    /// Allocation can be expensive on large sizes (the kernel must
-    /// reserve and lock physical pages), so callers should typically
-    /// allocate in big chunks once at warmup rather than per-tensor.
+    /// Default (flags=0) calls `mlock` under the hood and trips
+    /// `RLIMIT_MEMLOCK` (8 MB on stock Linux) for big arenas. The
+    /// `Coherent` variant uses AMD's USM/XNACK fine-grained path
+    /// which is backed by IOMMU mappings rather than process-level
+    /// page locks, and routinely succeeds where the default flag
+    /// would `hipErrorOutOfMemory`.
     pub fn host_malloc(&self, size: usize) -> HipResult<crate::HostBuffer> {
+        self.host_malloc_with_flags(size, 0)
+    }
+
+    /// Like `host_malloc` but lets the caller pick a `hipHostMalloc`
+    /// flag bitmask. WeightPager tries `Coherent` (`0x40000000`)
+    /// first and falls back to pageable on `hipErrorOutOfMemory`.
+    pub fn host_malloc_with_flags(&self, size: usize, flags: u32) -> HipResult<crate::HostBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
-        // flags = 0 = hipHostMallocDefault — the standard "page-locked,
-        // accessible by the calling device" behavior. Don't request
-        // Portable / Mapped / WriteCombined — we don't need cross-device
-        // visibility or device-mapped pointers for the host-tier cache,
-        // and WriteCombined would penalize the CPU writes that
-        // `Transport::read_to_host` does on every cold prefetch.
-        let code = unsafe { (self.fn_host_malloc)(&mut ptr, size, 0) };
+        let code = unsafe { (self.fn_host_malloc)(&mut ptr, size, flags) };
         self.check(code, "hipHostMalloc")?;
         Ok(unsafe { crate::HostBuffer::from_raw(ptr as *mut u8, size) })
     }
@@ -609,6 +615,19 @@ impl HipRuntime {
         let mut stream: HipStream = ptr::null_mut();
         let code = unsafe { (self.fn_stream_create)(&mut stream) };
         self.check(code, "hipStreamCreate")?;
+        Ok(Stream(stream))
+    }
+
+    /// Create a non-blocking stream — does NOT serialize against the
+    /// default stream. Required for compute/transfer overlap (the
+    /// default `hipStreamCreate` returns a "blocking" stream that
+    /// implicitly waits for default-stream work, defeating any
+    /// async memcpy issued on it).
+    pub fn stream_create_nonblocking(&self) -> HipResult<Stream> {
+        let mut stream: HipStream = ptr::null_mut();
+        // hipStreamNonBlocking = 0x1
+        let code = unsafe { (self.fn_stream_create_with_flags)(&mut stream, 0x1) };
+        self.check(code, "hipStreamCreateWithFlags(NonBlocking)")?;
         Ok(Stream(stream))
     }
 
