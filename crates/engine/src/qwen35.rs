@@ -1512,10 +1512,10 @@ fn pager_fill_dense_ffn_layer(
 }
 
 /// Async version: enqueue the three fills for `layer_idx`'s bytes
-/// onto the pager's transfer stream and return the three event idxs.
-/// Forward path overlaps these with compute on the default stream;
-/// `wait_transfer` synchronizes before the next layer reads the slot.
-/// No-op when not in paged_dense mode (returns empty Vec).
+/// onto the pager's transfer stream and return the event idxs that
+/// were actually issued async. `fill_into_async` returns `None` for
+/// the host-miss sync-fallback path (no event needed), so the
+/// returned Vec may have 0-3 entries depending on host-arena hits.
 fn pager_dense_async_prefetch_layer(
     weights: &Qwen35Weights,
     layer_idx: u16,
@@ -1527,19 +1527,26 @@ fn pager_dense_async_prefetch_layer(
     };
     use crate::weight_pager::{FfnRole, WeightId};
     let mut pager = pager_rc.borrow_mut();
-    let g = pager.fill_into_async(
+    let mut events = Vec::with_capacity(3);
+    if let Some(e) = pager.fill_into_async(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Gate },
         &scratch.gate[slot], gpu,
-    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill gate L{layer_idx}/s{slot}: {e}")))?;
-    let u = pager.fill_into_async(
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill gate L{layer_idx}/s{slot}: {e}")))? {
+        events.push(e);
+    }
+    if let Some(e) = pager.fill_into_async(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Up },
         &scratch.up[slot], gpu,
-    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill up L{layer_idx}/s{slot}: {e}")))?;
-    let d = pager.fill_into_async(
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill up L{layer_idx}/s{slot}: {e}")))? {
+        events.push(e);
+    }
+    if let Some(e) = pager.fill_into_async(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Down },
         &scratch.down[slot], gpu,
-    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill down L{layer_idx}/s{slot}: {e}")))?;
-    Ok(vec![g, u, d])
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill down L{layer_idx}/s{slot}: {e}")))? {
+        events.push(e);
+    }
+    Ok(events)
 }
 
 /// Build a `WeightTensor` view that aliases `slot_buf` with the metadata
@@ -2247,18 +2254,22 @@ fn qwen35_paged_moe_dispatch(
         if pager.host_arena_pinned() {
             let mut events = Vec::with_capacity(topk_indices.len() * 2);
             for &idx in topk_indices {
-                events.push(pager.ensure_resident_async(
+                if let Some(e) = pager.ensure_resident_async(
                     WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::GateUp },
                     gpu,
                 ).map_err(|e| hip_bridge::HipError::new(0, &format!(
                     "ensure_resident_async gate_up[{idx}] @ layer {layer}: {e}"
-                )))?);
-                events.push(pager.ensure_resident_async(
+                )))? {
+                    events.push(e);
+                }
+                if let Some(e) = pager.ensure_resident_async(
                     WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::Down },
                     gpu,
                 ).map_err(|e| hip_bridge::HipError::new(0, &format!(
                     "ensure_resident_async down[{idx}] @ layer {layer}: {e}"
-                )))?);
+                )))? {
+                    events.push(e);
+                }
             }
             for e in events {
                 pager.wait_transfer(e, gpu).map_err(|err| hip_bridge::HipError::new(0,

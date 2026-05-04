@@ -695,30 +695,27 @@ impl WeightPager {
     }
 
     /// **Async** ensure_resident: like [`ensure_resident`] but issues
-    /// the host→device copy on the pager's transfer stream and returns
-    /// a `TransferEventIdx` the caller waits on before launching a
-    /// kernel that reads `id`. Lets MoE forward batch the per-token
-    /// top-K expert fetches into one collective wait instead of paying
-    /// per-call host stall.
+    /// the host→device copy on the pager's transfer stream. Returns:
     ///
-    /// VRAM-hit fast-path: same as sync (touch LRU, return a fired
-    /// event so the caller's wait is a no-op).
-    ///
-    /// Cold + host-hit path: alloc fresh GpuTensor, async memcpy from
-    /// pinned host arena, record event on transfer stream, insert into
-    /// residency map.
-    ///
-    /// Cold + host-miss path: falls back to sync `transport.fetch`
-    /// (pread is blocking) and records an event on the default stream
-    /// so the caller's wait stays uniform.
+    /// - `None` when the weight is already VRAM-resident (LRU touched,
+    ///   no work scheduled). Critical for warm-cache workloads — the
+    ///   async-batch MoE forward can hit this 99%+ of the time at
+    ///   steady state, and the `None` short-circuit means it adds zero
+    ///   event overhead vs the sync path.
+    /// - `Some(idx)` when an async H2D was issued (cold + host-hit).
+    ///   Caller must `wait_transfer` before launching a kernel that
+    ///   reads the weight.
+    /// - `None` when the weight was sync-fetched from disk (cold +
+    ///   host-miss). By the time we return, the bytes are in VRAM and
+    ///   the residency map is updated; no wait needed.
     pub fn ensure_resident_async(
         &mut self,
         id: WeightId,
         gpu: &mut Gpu,
-    ) -> Result<TransferEventIdx, WeightPagerError> {
+    ) -> Result<Option<TransferEventIdx>, WeightPagerError> {
         if self.resident.contains_key(&id) {
             self.touch_lru(id);
-            return self.record_transfer_on_default_stream(gpu);
+            return Ok(None);
         }
         let range = *self
             .catalog
@@ -762,10 +759,11 @@ impl WeightPager {
             self.lru.push_back(id);
             let idx = self.transfer_events.len();
             self.transfer_events.push(evt);
-            return Ok(TransferEventIdx(idx));
+            return Ok(Some(TransferEventIdx(idx)));
         }
 
-        // Cold + host-miss — fall back to sync fetch.
+        // Cold + host-miss — fall back to sync fetch. By return-time
+        // the bytes are already in VRAM; no event needed.
         let (tensor, _h) = self.transport.fetch(range.offset, range.len, gpu)?;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         self.resident.insert(id, Resident { tensor, bytes: need });
@@ -776,7 +774,7 @@ impl WeightPager {
                 range.len
             );
         }
-        self.record_transfer_on_default_stream(gpu)
+        Ok(None)
     }
 
     /// Populate the pinned-host tier for `id` without touching the GPU.
@@ -975,43 +973,40 @@ impl WeightPager {
     }
 
     /// **Async** fill: enqueue an H2D copy for `id` into `dst` on the
-    /// pager's dedicated transfer stream. Returns an event index that
-    /// the caller passes to [`wait_transfer`] before reading `dst`
-    /// (e.g. before launching a kernel that consumes it).
+    /// pager's dedicated transfer stream. Returns:
     ///
-    /// Source is the host tier (v0.3-α arena). When the weight isn't
-    /// host-resident, this falls back to the synchronous path —
-    /// `transport.read_to_host` is blocking pread, so there's no
-    /// async benefit until the weight is in the arena. v0.3-β-α
-    /// scope: dense paged forward warms host tier opportunistically
-    /// during prefetch_all_to_host, so steady-state is "always async."
+    /// - `Some(idx)` when the copy was issued asynchronously (host-hit
+    ///   path, real overlap potential). Caller must `wait_transfer(idx)`
+    ///   before reading `dst`.
+    /// - `None` when the work completed synchronously before this
+    ///   function returned (host-miss → blocking transport.fill_into).
+    ///   Caller can use `dst` immediately, no wait needed.
     ///
-    /// Stream + scratch ordering is the caller's responsibility: this
-    /// only guarantees `dst` won't be read by the transfer past
-    /// completion of the returned event.
+    /// `Option` lets callers cheaply skip event ceremony on the sync
+    /// path — event_create + record + sync + destroy is ~tens of
+    /// microseconds per call and dominates per-token overhead when
+    /// most calls are no-async (e.g. warm-cache MoE inference where
+    /// the VRAM-hit fast path exists).
     pub fn fill_into_async(
         &mut self,
         id: WeightId,
         dst: &GpuTensor,
         gpu: &mut Gpu,
-    ) -> Result<TransferEventIdx, WeightPagerError> {
+    ) -> Result<Option<TransferEventIdx>, WeightPagerError> {
         let range = *self
             .catalog
             .get(&id)
             .ok_or(WeightPagerError::NotRegistered(id))?;
         // Cold-load into host arena if missing (opportunistic — sync
         // pread). If the arena is full, this returns false and we
-        // fall back to the v0.2 sync path so the caller doesn't see
-        // a partial async semantics.
+        // fall back to the v0.2 sync path.
         let host_hit = self.host_resident.contains_key(&id)
             || self.try_cold_load_into_host(id, range, gpu)?;
         if !host_hit {
-            // No host shadow available — sync transport path. The
-            // caller still gets an event back so the consumer wait
-            // pattern is uniform; we record an event on the default
-            // stream after the sync copy.
+            // No host shadow — sync transport path. By the time it
+            // returns the data is in `dst`; no event needed.
             self.transport.fill_into(range.offset, range.len, dst, gpu)?;
-            return self.record_transfer_on_default_stream(gpu);
+            return Ok(None);
         }
         // Host hit: async memcpy on transfer stream + event record.
         self.ensure_transfer_stream(gpu)?;
@@ -1032,7 +1027,7 @@ impl WeightPager {
         self.touch_host_lru(id);
         let idx = self.transfer_events.len();
         self.transfer_events.push(evt);
-        Ok(TransferEventIdx(idx))
+        Ok(Some(TransferEventIdx(idx)))
     }
 
     /// Block until the transfer for `idx` completes. Safe to call
@@ -1094,24 +1089,6 @@ impl WeightPager {
         let stream = self.transfer_stream.as_ref().unwrap();
         gpu.hip.stream_wait_event(stream, compute_event)?;
         Ok(())
-    }
-
-    /// Record an event after a synchronous transfer so the caller can
-    /// uniformly wait. Used when async fill fell back to sync path
-    /// (e.g. host arena was full). The event records on the default
-    /// stream so it fires after the prior synchronous copy completes.
-    fn record_transfer_on_default_stream(
-        &mut self,
-        gpu: &mut Gpu,
-    ) -> Result<TransferEventIdx, WeightPagerError> {
-        let evt = gpu.hip.event_create()?;
-        // Record on default stream (None) so the event fires once any
-        // already-issued default-stream work — including the sync copy
-        // we just did — completes.
-        gpu.hip.event_record(&evt, None)?;
-        let idx = self.transfer_events.len();
-        self.transfer_events.push(evt);
-        Ok(TransferEventIdx(idx))
     }
 
     /// Patch the device-side `expert_*_ptrs` indirection table so the indexed
