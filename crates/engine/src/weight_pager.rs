@@ -218,6 +218,24 @@ pub trait Transport: Send {
     fn alignment(&self) -> usize {
         1
     }
+
+    /// **Predictive readahead hint** (v0.3-ε). Caller is about to need
+    /// these byte ranges; transport may pre-warm internal caches or
+    /// kick off OS-level readahead so subsequent `read_to_host` /
+    /// `fill_into` calls hit warm state. Best-effort — kernel is free
+    /// to ignore.
+    ///
+    /// Designed to be called from the forward path while the GPU is
+    /// busy on the current layer's compute, naming the next K layers'
+    /// weight ranges. The kernel's NVMe driver can issue many parallel
+    /// reads in the background while our process is otherwise occupied,
+    /// extracting the drive's full QD-N bandwidth without us having to
+    /// build our own thread pool. Default impl is a no-op so transports
+    /// that don't benefit (in-memory mocks, future P2P-DMA paths) just
+    /// ignore it.
+    fn advise_prefetch(&self, ranges: &[ByteRange]) {
+        let _ = ranges;
+    }
 }
 
 /// v0.1 transport: pread the requested byte range from the HFQ file into a
@@ -380,6 +398,39 @@ impl Transport for PreadH2DTransport {
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         // Transfers complete synchronously inside `fetch`/`fill_into` in v0.1.
         Ok(())
+    }
+
+    /// `posix_fadvise(WILLNEED)` per range — tells the kernel to pull
+    /// these byte ranges into page cache via background readahead.
+    /// Subsequent `pread` against the same ranges then hits warm cache
+    /// (memcpy speed, ~10 GB/s) instead of going to the NVMe (~500 MB/s
+    /// QD=1 sequential ceiling on a healthy SN850X).
+    ///
+    /// Note: the file-wide `POSIX_FADV_RANDOM` set in `open` disables
+    /// the *automatic* sequential-readahead heuristic; explicit
+    /// `WILLNEED` hints are still honored independently. So we get
+    /// per-tensor readahead exactly where we ask for it without the
+    /// kernel speculating across unrelated tensors.
+    fn advise_prefetch(&self, ranges: &[ByteRange]) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            for r in ranges {
+                // Best-effort: ignore the return code. EBADF can't
+                // happen (fd is owned), EINVAL would mean an absurd
+                // offset/len combo we'd hit elsewhere first.
+                unsafe {
+                    libc::posix_fadvise(
+                        fd,
+                        r.offset as libc::off_t,
+                        r.len as libc::off_t,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+        }
+        let _ = ranges;
     }
 }
 
@@ -1161,6 +1212,46 @@ impl WeightPager {
             self.prefetch_to_host(id, gpu)?;
         }
         Ok(())
+    }
+
+    /// **Predictive readahead** (v0.3-ε): tell the OS we're about to
+    /// need these weights. Maps each [`WeightId`] to its byte range via
+    /// the catalog and forwards to [`Transport::advise_prefetch`].
+    /// Skips ids that are already host-resident (no disk re-read needed)
+    /// and ids missing from the catalog (loader bug — hint is best-effort,
+    /// not worth panicking).
+    ///
+    /// **Intended call site**: from the forward path while the GPU is
+    /// busy on the current layer's compute, name the next K layers'
+    /// weights. The kernel's NVMe driver issues parallel readaheads in
+    /// the background; subsequent cold-loads in `try_cold_load_into_host`
+    /// pread from warm page cache instead of the drive, which lifts the
+    /// effective transport bandwidth from the QD=1 sequential ceiling
+    /// (~500 MB/s on SN850X) toward what a realistic concurrent workload
+    /// can extract (3+ GB/s on the same drive).
+    ///
+    /// Cheap to call (one syscall per range, no I/O on the calling
+    /// thread). Safe to over-call — duplicate `WILLNEED` hints are
+    /// idempotent at the kernel level.
+    pub fn advise_prefetch(&self, ids: &[WeightId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut ranges: Vec<ByteRange> = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Skip already-host-resident: the bytes are in our pinned
+            // arena, no disk read happens for them. Skip uncatalogued:
+            // loader-side bug, not the prefetch path's job to surface.
+            if self.host_resident.contains_key(id) {
+                continue;
+            }
+            if let Some(range) = self.catalog.get(id) {
+                ranges.push(*range);
+            }
+        }
+        if !ranges.is_empty() {
+            self.transport.advise_prefetch(&ranges);
+        }
     }
 
     fn touch_host_lru(&mut self, id: WeightId) {

@@ -5526,6 +5526,58 @@ fn forward_scratch_layers(
     }
 
     for layer_idx in 0..config.n_layers {
+        // v0.3-ε predictive readahead: tell the kernel about the next K
+        // layers' weight ranges so its NVMe driver can issue parallel
+        // background reads while our process is busy with layer N's
+        // compute (or our own pread for layer N+1). Lifts the effective
+        // transport bandwidth from the QD=1 pread ceiling (~500 MB/s on
+        // SN850X with our access pattern) toward what the drive can
+        // actually deliver under concurrent reads (3+ GB/s).
+        //
+        // Lookahead K is tunable via `HIPFIRE_FADVISE_LOOKAHEAD` (default 1).
+        // Larger K = more parallelism for the kernel's NVMe driver, but
+        // also more page-cache pressure: each advised layer pulls ~142 MB
+        // of file pages into cache, competing with model file pages we
+        // still need + our own pinned arena. K=0 disables predictive
+        // readahead entirely (file-wide POSIX_FADV_RANDOM still applies).
+        // No-op when not paged_dense, when the bytes are already host-
+        // resident, or when K=0.
+        if dense_paged {
+            if let Some(pager_rc) = &weights.pager {
+                use crate::weight_pager::{FfnRole, WeightId};
+                // Default K=2: sensible lookahead for the target hipfire
+                // user — a 16 GB-VRAM-class GPU paired with 32+ GB system
+                // RAM, running models that don't fit in VRAM. With that
+                // RAM headroom (after a multi-GB mlock'd arena), fadvise
+                // pulls upcoming-layer pages into page cache without
+                // evicting anything we still need; subsequent preads hit
+                // warm cache (~10 GB/s) instead of the QD=1 NVMe ceiling
+                // (~500 MB/s on SN850X-class drives).
+                //
+                // **Set `HIPFIRE_FADVISE_LOOKAHEAD=0` to disable** on
+                // RAM-tight systems (e.g. 16 GB total + a multi-GB arena
+                // + a multi-GB model mmap), where every fadvise call
+                // forces eviction of pages we'll need next and the
+                // resulting cache thrash is worse than no prefetch.
+                // Empirical: on a 16 GB box with 4 GB mlock'd arena,
+                // K=3 was 4× slower than K=0; the safe default for that
+                // class of system is K=0.
+                let lookahead: usize = std::env::var("HIPFIRE_FADVISE_LOOKAHEAD")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+                if lookahead > 0 {
+                    let pager = pager_rc.borrow();
+                    let mut advise_ids: Vec<WeightId> = Vec::with_capacity(3 * lookahead);
+                    for k in 1..=lookahead {
+                        let li = layer_idx + k;
+                        if li >= config.n_layers { break; }
+                        advise_ids.push(WeightId::DenseFfn { layer: li as u16, role: FfnRole::Gate });
+                        advise_ids.push(WeightId::DenseFfn { layer: li as u16, role: FfnRole::Up });
+                        advise_ids.push(WeightId::DenseFfn { layer: li as u16, role: FfnRole::Down });
+                    }
+                    pager.advise_prefetch(&advise_ids);
+                }
+            }
+        }
         let active_slot = layer_idx & 1;
 
         if async_overlap {
