@@ -1065,13 +1065,37 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 host_budget_bytes: config.host_budget_bytes,
                 trace: std::env::var("HIPFIRE_PAGER_TRACE").is_ok(),
             };
-            let pager = crate::weight_pager::WeightPager::with_pread_transport(
-                hfq.path(),
-                pager_cfg,
-            )
-            .map_err(|e| hip_bridge::HipError::new(0, &format!(
-                "failed to open HFQ file for paged transport: {}", e
-            )))?;
+            // v0.4: HIPFIRE_TRANSPORT={pread|iouring} selects which
+            // transport backs the pager. Default `pread` for compat with
+            // every prior session; `iouring` engages the batched io_uring
+            // path which lifts the pread QD=1 ceiling for sub-working-set
+            // workloads (multi-GB cold-load churn per token).
+            let transport_choice = std::env::var("HIPFIRE_TRANSPORT")
+                .unwrap_or_else(|_| "pread".to_string());
+            let pager = match transport_choice.as_str() {
+                #[cfg(target_os = "linux")]
+                "iouring" => {
+                    eprintln!("[weight_pager] transport: io_uring (v0.4 batched parallel reads)");
+                    crate::weight_pager::WeightPager::with_iouring_transport(
+                        hfq.path(), pager_cfg,
+                    ).map_err(|e| hip_bridge::HipError::new(0, &format!(
+                        "failed to open HFQ file for io_uring transport: {}", e
+                    )))?
+                }
+                "pread" => {
+                    eprintln!("[weight_pager] transport: pread (v0.1 single-threaded QD=1)");
+                    crate::weight_pager::WeightPager::with_pread_transport(
+                        hfq.path(), pager_cfg,
+                    ).map_err(|e| hip_bridge::HipError::new(0, &format!(
+                        "failed to open HFQ file for pread transport: {}", e
+                    )))?
+                }
+                other => {
+                    return Err(hip_bridge::HipError::new(0, &format!(
+                        "unknown HIPFIRE_TRANSPORT='{other}' — expected 'pread' or 'iouring'"
+                    )));
+                }
+            };
             Some(std::rc::Rc::new(std::cell::RefCell::new(pager)))
         } else {
             None
@@ -1525,8 +1549,30 @@ fn pager_dense_async_prefetch_layer(
     let (Some(scratch), Some(pager_rc)) = (&weights.dense_scratch, &weights.pager) else {
         return Ok(Vec::new());
     };
-    use crate::weight_pager::{FfnRole, WeightId};
+    use crate::weight_pager::{ByteRange, FfnRole, WeightId};
     let mut pager = pager_rc.borrow_mut();
+
+    // v0.4: batch the host-tier population for this layer's 3 weights
+    // so the underlying transport can issue all 3 file reads in
+    // parallel (io_uring submits them in one syscall, pread falls back
+    // to sequential — same end state, transparent to the caller).
+    // After this returns, any of the 3 ids that fit in the host tier
+    // are already host-resident, so the fill_into_async calls below
+    // skip their cold-load step and only do the async H2D issue.
+    let ids = [
+        WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Gate },
+        WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Up },
+        WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Down },
+    ];
+    let batch_input: Vec<(WeightId, ByteRange)> = ids.iter()
+        .filter_map(|id| pager.byte_range_of(*id).map(|r| (*id, r)))
+        .collect();
+    pager.try_cold_load_batch_into_host(&batch_input, gpu).map_err(|e| {
+        hip_bridge::HipError::new(0, &format!(
+            "paged batch cold-load L{layer_idx}/s{slot}: {e}"
+        ))
+    })?;
+
     let mut events = Vec::with_capacity(3);
     if let Some(e) = pager.fill_into_async(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Gate },

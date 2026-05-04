@@ -219,6 +219,28 @@ pub trait Transport: Send {
         1
     }
 
+    /// **Batched parallel host reads** (v0.4). Issue every read in
+    /// `batch` and wait for all to complete. Default impl is sequential
+    /// (just calls `read_to_host` per item — preserves correctness for
+    /// transports that haven't bothered to override). Parallel-capable
+    /// transports (`IoUringHostTransport`) override with a single
+    /// batched submission, lifting effective drive bandwidth from the
+    /// QD=1 ceiling toward the drive's rated parallel throughput.
+    ///
+    /// Tuple format: `(file_byte_range, host_destination_slice)`.
+    /// Caller guarantees:
+    /// - `dst.len() == range.len` for every (range, dst) pair
+    /// - destination slices do not overlap each other
+    fn read_to_host_par(
+        &mut self,
+        batch: &mut [(ByteRange, &mut [u8])],
+    ) -> HipResult<()> {
+        for (range, dst) in batch.iter_mut() {
+            self.read_to_host(range.offset, range.len, dst)?;
+        }
+        Ok(())
+    }
+
     /// **Predictive readahead hint** (v0.3-ε). Caller is about to need
     /// these byte ranges; transport may pre-warm internal caches or
     /// kick off OS-level readahead so subsequent `read_to_host` /
@@ -420,6 +442,278 @@ impl Transport for PreadH2DTransport {
                 // Best-effort: ignore the return code. EBADF can't
                 // happen (fd is owned), EINVAL would mean an absurd
                 // offset/len combo we'd hit elsewhere first.
+                unsafe {
+                    libc::posix_fadvise(
+                        fd,
+                        r.offset as libc::off_t,
+                        r.len as libc::off_t,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+        }
+        let _ = ranges;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IoUringHostTransport (v0.4)
+// ---------------------------------------------------------------------------
+
+/// **v0.4 transport: io_uring batched reads into the host arena.**
+///
+/// `PreadH2DTransport` tops out at single-threaded queue-depth-1
+/// sequential reads — ~500 MB/s on an SN850X-class drive even though
+/// the drive can deliver multi-GB/s with parallel I/O. This transport
+/// submits N reads in one syscall via io_uring's submission queue,
+/// then drains N completions in one syscall — letting the kernel's
+/// NVMe driver schedule the I/O in parallel. For our 3-weights-per-
+/// layer batches that's effective QD=3 per submission; the ring is
+/// sized for headroom (default 32 SQEs) so deeper batching is possible
+/// without resizing.
+///
+/// Linux 5.1+ (we use only basic IORING_OP_READ ops). Reads are
+/// **non-O_DIRECT** through the page cache — same semantics as
+/// `PreadH2DTransport`, just much more efficient I/O scheduling.
+/// A future v0.5+ `IoUringP2PTransport` would add `dma_buf`-mapped
+/// VRAM destinations for true NVMe→VRAM with no host hop; that's
+/// out of scope here.
+#[cfg(target_os = "linux")]
+pub struct IoUringHostTransport {
+    file: File,
+    path: std::path::PathBuf,
+    ring: io_uring::IoUring,
+    /// Reusable host staging buffer for the single-shot `fetch` /
+    /// `fill_into` paths that need a host hop before going to GPU.
+    /// Mirrors `PreadH2DTransport::staging`.
+    staging: Vec<u8>,
+    next_handle: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringHostTransport {
+    /// Open the HFQ file and create an io_uring with the default
+    /// queue depth (32 SQE slots). Plenty for per-layer 3-weight
+    /// batches with headroom.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_with_depth(path, 32)
+    }
+
+    /// Open with a custom queue depth. Larger = more parallel reads
+    /// per submission, more ring memory. Power-of-2 recommended per
+    /// io_uring conventions.
+    pub fn open_with_depth(path: &Path, queue_depth: u32) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        // Same file-wide hint as PreadH2D — disables auto-readahead
+        // based on sequential heuristics. WILLNEED hints (issued via
+        // `advise_prefetch`) still work independently for explicit
+        // pre-warming.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+            }
+        }
+        let ring = io_uring::IoUring::new(queue_depth)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            ring,
+            staging: Vec::new(),
+            next_handle: 0,
+        })
+    }
+
+    /// Path the transport was opened with. Useful for diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn next_handle(&mut self) -> TransferHandle {
+        let h = TransferHandle(self.next_handle);
+        self.next_handle += 1;
+        h
+    }
+
+    /// Submit a single read SQE and wait for its completion. Used by
+    /// the single-shot `fetch` / `fill_into` / `read_to_host` paths.
+    fn iouring_read_one(
+        &mut self,
+        dst_ptr: *mut u8,
+        len: usize,
+        file_offset: usize,
+    ) -> HipResult<()> {
+        use io_uring::{opcode, types};
+        use std::os::unix::io::AsRawFd;
+
+        let read_op = opcode::Read::new(
+            types::Fd(self.file.as_raw_fd()),
+            dst_ptr,
+            len as u32,
+        )
+        .offset(file_offset as u64)
+        .build()
+        .user_data(0);
+
+        // Safety: caller guarantees dst_ptr/len is a valid mutable
+        // region for `len` bytes; fd is valid for self's lifetime.
+        unsafe {
+            self.ring.submission().push(&read_op).map_err(|_| {
+                hip_bridge::HipError::new(0, "io_uring SQ full (single read)")
+            })?;
+        }
+        self.ring.submit_and_wait(1).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("io_uring submit_and_wait (single): {e}"))
+        })?;
+
+        let cqe = self.ring.completion().next().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "io_uring CQE missing for single read")
+        })?;
+        let result = cqe.result();
+        if result < 0 || result as usize != len {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "io_uring read returned {result} (expected {len} bytes at offset {file_offset})"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Transport for IoUringHostTransport {
+    fn fetch(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<(GpuTensor, TransferHandle)> {
+        if self.staging.len() < len {
+            self.staging.resize(len, 0);
+        }
+        let staging_ptr = self.staging.as_mut_ptr();
+        self.iouring_read_one(staging_ptr, len, hfq_offset)?;
+        let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
+        Ok((tensor, self.next_handle()))
+    }
+
+    fn fill_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        if self.staging.len() < len {
+            self.staging.resize(len, 0);
+        }
+        let staging_ptr = self.staging.as_mut_ptr();
+        self.iouring_read_one(staging_ptr, len, hfq_offset)?;
+        gpu.hip.memcpy_htod(&dst.buf, &self.staging[..len])
+    }
+
+    fn read_to_host(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> HipResult<()> {
+        debug_assert_eq!(dst.len(), len);
+        let dst_ptr = dst.as_mut_ptr();
+        self.iouring_read_one(dst_ptr, len, hfq_offset)
+    }
+
+    fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
+        // Reads complete inside the iouring_read_* helpers (they call
+        // submit_and_wait). No deferred completion state to drain.
+        Ok(())
+    }
+
+    /// **The win.** Submit every read in `batch` as one SQE-per-read
+    /// in a single push pass, submit them all in one syscall, drain
+    /// every CQE in one pass. CQEs may complete out of submission
+    /// order; we use `user_data` tags to correlate per-request and
+    /// validate each completion against its original byte length.
+    fn read_to_host_par(
+        &mut self,
+        batch: &mut [(ByteRange, &mut [u8])],
+    ) -> HipResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        use io_uring::{opcode, types};
+        use std::os::unix::io::AsRawFd;
+        let fd = self.file.as_raw_fd();
+
+        // Phase 1: push all SQEs onto the submission queue.
+        // (Scoped to release the SubmissionQueue borrow before submit.)
+        let n = batch.len();
+        {
+            let mut sq = self.ring.submission();
+            for (i, (range, dst)) in batch.iter_mut().enumerate() {
+                debug_assert_eq!(dst.len(), range.len);
+                let read_op = opcode::Read::new(
+                    types::Fd(fd),
+                    dst.as_mut_ptr(),
+                    range.len as u32,
+                )
+                .offset(range.offset as u64)
+                .build()
+                .user_data(i as u64);
+                // Safety: caller guarantees dst slices are valid for
+                // their declared lengths and don't overlap; fd is
+                // valid for self's lifetime.
+                unsafe {
+                    sq.push(&read_op).map_err(|_| {
+                        hip_bridge::HipError::new(0, &format!(
+                            "io_uring SQ full at batch idx {i}/{n}"
+                        ))
+                    })?;
+                }
+            }
+        }
+
+        // Phase 2: one syscall to submit and wait for all completions.
+        self.ring.submit_and_wait(n).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("io_uring batch submit_and_wait: {e}"))
+        })?;
+
+        // Phase 3: drain exactly N completions, validate each. Snapshot
+        // the (offset, len) per slot before this borrow so we can reference
+        // them while the CQE iterator holds &mut self.ring transitively.
+        let expected_per_idx: Vec<(usize, usize)> = batch.iter()
+            .map(|(r, _)| (r.offset, r.len))
+            .collect();
+        let mut cq = self.ring.completion();
+        for _ in 0..n {
+            let cqe = cq.next().ok_or_else(|| {
+                hip_bridge::HipError::new(0, "io_uring batch CQE missing")
+            })?;
+            let idx = cqe.user_data() as usize;
+            if idx >= n {
+                return Err(hip_bridge::HipError::new(0, &format!(
+                    "io_uring batch CQE has bogus user_data {idx} (batch size {n})"
+                )));
+            }
+            let result = cqe.result();
+            let (file_off, expected) = expected_per_idx[idx];
+            if result < 0 || result as usize != expected {
+                return Err(hip_bridge::HipError::new(0, &format!(
+                    "io_uring batch read [{idx}] returned {result} (expected {expected} bytes at offset {file_off})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn advise_prefetch(&self, ranges: &[ByteRange]) {
+        // Same as PreadH2D — POSIX_FADV_WILLNEED. io_uring does have
+        // IORING_OP_FADVISE but adds plumbing for marginal value here.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            for r in ranges {
                 unsafe {
                     libc::posix_fadvise(
                         fd,
@@ -674,6 +968,16 @@ impl WeightPager {
         Ok(Self::new(Box::new(transport), config))
     }
 
+    /// **v0.4 convenience**: open `hfq_path` with the io_uring batched
+    /// transport. Linux-only. Use when the workload involves repeated
+    /// cold-loads (sub-working-set host budget) where the QD=1 ceiling
+    /// of pread becomes the bottleneck.
+    #[cfg(target_os = "linux")]
+    pub fn with_iouring_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
+        let transport = IoUringHostTransport::open(hfq_path)?;
+        Ok(Self::new(Box::new(transport), config))
+    }
+
     /// Register that `id` lives at `range` in the HFQ file. Called by the
     /// loader when it walks the tensor index. Must be called before any
     /// `ensure_resident(id)` for that id.
@@ -684,6 +988,14 @@ impl WeightPager {
     /// Number of registered weights. Useful for diagnostics.
     pub fn registered_count(&self) -> usize {
         self.catalog.len()
+    }
+
+    /// Look up the on-disk byte range for `id`. Returns `None` when
+    /// the weight wasn't `register`'d. Used by callers building batches
+    /// for [`Self::try_cold_load_batch_into_host`] without walking the
+    /// catalog themselves.
+    pub fn byte_range_of(&self, id: WeightId) -> Option<ByteRange> {
+        self.catalog.get(&id).copied()
     }
 
     /// Returns true if `id` is currently in VRAM.
@@ -1043,67 +1355,10 @@ impl WeightPager {
         if self.config.host_budget_bytes == 0 {
             return Ok(false);
         }
-        // ensure_host_arena clamps the budget to MemAvailable, so do it
-        // up front and read the *clamped* cap below — otherwise the
-        // allocator could carve past what was actually mapped.
         self.ensure_host_arena(gpu)?;
-        let arena_cap = self.config.host_budget_bytes as usize;
-        if range.len > arena_cap {
-            // Single weight bigger than the entire (clamped) arena. No
-            // amount of eviction creates room. Caller falls back to disk.
-            if self.config.trace {
-                eprintln!(
-                    "[weight_pager] host-load skip {id:?}: weight {} bytes > arena cap {} bytes",
-                    range.len, arena_cap,
-                );
-            }
-            return Ok(false);
-        }
-
-        // One-shot stream sync (lazy, only if we end up evicting). An
-        // in-flight memcpy_htod_async could be reading a slot we're
-        // about to recycle; sync the transfer stream once before any
-        // eviction fires so the recycled offset is safe to overwrite.
-        let mut transfer_synced = false;
-        let offset = loop {
-            // (1) Pool hit — same-size slot left over from an eviction.
-            if let Some(off) = self
-                .host_pools
-                .get_mut(&range.len)
-                .and_then(|v| v.pop())
-            {
-                break off;
-            }
-            // (2) Tail carve — first-time slot creation.
-            if self.host_high_water + range.len <= arena_cap {
-                let off = self.host_high_water;
-                self.host_high_water += range.len;
-                break off;
-            }
-            // (3) Evict one and retry. Sync once before the first
-            // eviction; subsequent iterations see `transfer_synced=true`
-            // and skip the redundant wait.
-            if !transfer_synced {
-                if let Some(stream) = self.transfer_stream.as_ref() {
-                    gpu.hip.stream_synchronize(stream)?;
-                }
-                transfer_synced = true;
-            }
-            if !self.evict_one_host_lru() {
-                // LRU empty: arena is fully carved, no pool slot of
-                // this size, and nothing left to evict. Cross-size
-                // saturation (e.g. arena full of size-A slots, asking
-                // for size-B that has zero residents). Caller falls
-                // back to v0.2 disk path for this weight.
-                if self.config.trace {
-                    eprintln!(
-                        "[weight_pager] host-load skip {id:?}: arena saturated with no \
-                         size-{} slots and LRU exhausted",
-                        range.len,
-                    );
-                }
-                return Ok(false);
-            }
+        let offset = match self.try_acquire_host_slot(id, range, gpu)? {
+            Some(o) => o,
+            None => return Ok(false),
         };
 
         let need = range.len as u64;
@@ -1130,6 +1385,153 @@ impl WeightPager {
             );
         }
         Ok(true)
+    }
+
+    /// **v0.4 batched cold-load**: acquire host slots for every id in
+    /// `batch`, then issue all the file reads in parallel via
+    /// [`Transport::read_to_host_par`]. Single-shot path is just the
+    /// 1-element case of this; the win shows up at batch sizes ≥ 2
+    /// when the transport supports parallel reads (io_uring).
+    ///
+    /// Skips ids that are already host-resident, larger than the entire
+    /// arena, or hit cross-size saturation. Updates the residency map
+    /// (and LRU + used_bytes) for every id that was actually loaded.
+    /// Returns the count loaded (skips don't count).
+    pub fn try_cold_load_batch_into_host(
+        &mut self,
+        batch: &[(WeightId, ByteRange)],
+        gpu: &mut Gpu,
+    ) -> Result<usize, WeightPagerError> {
+        if self.config.host_budget_bytes == 0 || batch.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_host_arena(gpu)?;
+
+        // Phase 1: allocate slots sequentially. Skip ids that:
+        // - are already host-resident (no work)
+        // - can't be allocated (too big or LRU exhausted)
+        let mut allocations: Vec<(WeightId, ByteRange, usize)> = Vec::with_capacity(batch.len());
+        for &(id, range) in batch {
+            if self.host_resident.contains_key(&id) {
+                continue;
+            }
+            match self.try_acquire_host_slot(id, range, gpu)? {
+                Some(off) => allocations.push((id, range, off)),
+                None => continue,
+            }
+        }
+        if allocations.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2: parallel batched pread. Construct (range, &mut [u8])
+        // tuples backed by non-overlapping arena slices.
+        //
+        // Safety: the slab allocator guarantees the offsets are in
+        // [0, arena_cap) and don't overlap each other. The arena buffer
+        // outlives the slices because we hold &mut self.host_arena via
+        // arena_base, and we don't touch host_arena between constructing
+        // the slices and consuming them in read_to_host_par.
+        {
+            let arena = self.host_arena.as_mut().expect("ensure_host_arena succeeded");
+            let arena_base = arena.as_mut_slice().as_mut_ptr();
+            let mut chunks: Vec<(ByteRange, &mut [u8])> = allocations
+                .iter()
+                .map(|&(_, range, off)| {
+                    let dst: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(arena_base.add(off), range.len)
+                    };
+                    (range, dst)
+                })
+                .collect();
+            self.transport.read_to_host_par(&mut chunks)?;
+        }
+
+        // Phase 3: update residency map for everything that loaded.
+        let n = allocations.len();
+        for &(id, range, off) in &allocations {
+            let bytes = range.len as u64;
+            self.host_used_bytes = self.host_used_bytes.saturating_add(bytes);
+            self.host_resident.insert(id, HostResident { offset: off, bytes });
+            self.host_lru.push_back(id);
+        }
+        if self.config.trace {
+            eprintln!(
+                "[weight_pager] host-load(batch) {} weights — \
+                 used {}MB / hi-water {}MB / {} entries",
+                n,
+                self.host_used_bytes / (1024 * 1024),
+                self.host_high_water / (1024 * 1024),
+                self.host_resident.len()
+            );
+        }
+        Ok(n)
+    }
+
+    /// Acquire a single host arena slot of `range.len` bytes via the
+    /// slab allocator (v0.3-δ). Returns `Some(offset)` on success;
+    /// `None` when the weight is bigger than the entire arena OR the
+    /// arena hits cross-size saturation with an empty LRU. Does NOT
+    /// touch `host_used_bytes`, `host_resident`, or `host_lru` —
+    /// caller owns the post-fill bookkeeping.
+    ///
+    /// Caller must have already called `ensure_host_arena`.
+    fn try_acquire_host_slot(
+        &mut self,
+        id: WeightId,
+        range: ByteRange,
+        gpu: &mut Gpu,
+    ) -> Result<Option<usize>, WeightPagerError> {
+        let arena_cap = self.config.host_budget_bytes as usize;
+        if range.len > arena_cap {
+            if self.config.trace {
+                eprintln!(
+                    "[weight_pager] host-load skip {id:?}: weight {} bytes > arena cap {} bytes",
+                    range.len, arena_cap,
+                );
+            }
+            return Ok(None);
+        }
+        // One-shot stream sync (lazy, only if eviction is needed). An
+        // in-flight memcpy_htod_async could be reading a slot we're
+        // about to recycle; sync the transfer stream once before any
+        // eviction fires so the recycled offset is safe to overwrite.
+        let mut transfer_synced = false;
+        loop {
+            // (1) Pool hit — same-size slot left over from an eviction.
+            if let Some(off) = self
+                .host_pools
+                .get_mut(&range.len)
+                .and_then(|v| v.pop())
+            {
+                return Ok(Some(off));
+            }
+            // (2) Tail carve — first-time slot creation.
+            if self.host_high_water + range.len <= arena_cap {
+                let off = self.host_high_water;
+                self.host_high_water += range.len;
+                return Ok(Some(off));
+            }
+            // (3) Evict one and retry.
+            if !transfer_synced {
+                if let Some(stream) = self.transfer_stream.as_ref() {
+                    gpu.hip.stream_synchronize(stream)?;
+                }
+                transfer_synced = true;
+            }
+            if !self.evict_one_host_lru() {
+                // LRU empty: cross-size saturation. Caller falls back
+                // to v0.2 disk path for this weight.
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] host-load skip {id:?}: arena saturated with no \
+                         size-{} slots and LRU exhausted",
+                        range.len,
+                    );
+                }
+                return Ok(None);
+            }
+        }
     }
 
     /// Pop the LRU front, free its slot back to the size pool, and
