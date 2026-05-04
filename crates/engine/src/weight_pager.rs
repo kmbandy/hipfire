@@ -694,6 +694,91 @@ impl WeightPager {
         Ok(())
     }
 
+    /// **Async** ensure_resident: like [`ensure_resident`] but issues
+    /// the host→device copy on the pager's transfer stream and returns
+    /// a `TransferEventIdx` the caller waits on before launching a
+    /// kernel that reads `id`. Lets MoE forward batch the per-token
+    /// top-K expert fetches into one collective wait instead of paying
+    /// per-call host stall.
+    ///
+    /// VRAM-hit fast-path: same as sync (touch LRU, return a fired
+    /// event so the caller's wait is a no-op).
+    ///
+    /// Cold + host-hit path: alloc fresh GpuTensor, async memcpy from
+    /// pinned host arena, record event on transfer stream, insert into
+    /// residency map.
+    ///
+    /// Cold + host-miss path: falls back to sync `transport.fetch`
+    /// (pread is blocking) and records an event on the default stream
+    /// so the caller's wait stays uniform.
+    pub fn ensure_resident_async(
+        &mut self,
+        id: WeightId,
+        gpu: &mut Gpu,
+    ) -> Result<TransferEventIdx, WeightPagerError> {
+        if self.resident.contains_key(&id) {
+            self.touch_lru(id);
+            return self.record_transfer_on_default_stream(gpu);
+        }
+        let range = *self
+            .catalog
+            .get(&id)
+            .ok_or(WeightPagerError::NotRegistered(id))?;
+        let need = range.len as u64;
+        if self.config.vram_budget_bytes != u64::MAX
+            && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
+        {
+            self.evict_lru_until(need, gpu)?;
+        }
+
+        let host_hit = self.host_resident.contains_key(&id)
+            || self.try_cold_load_into_host(id, range, gpu)?;
+        if host_hit {
+            // Async H2D from pinned arena → fresh device buffer.
+            self.ensure_transfer_stream(gpu)?;
+            let device_buf = gpu.hip.malloc(range.len)?;
+            let evt = gpu.hip.event_create()?;
+            {
+                let stream = self.transfer_stream.as_ref().unwrap();
+                let h = self.host_resident.get(&id).unwrap();
+                let arena = self.host_arena.as_ref().expect(
+                    "host_resident populated without host_arena — pager invariant",
+                );
+                gpu.hip.memcpy_htod_async(
+                    &device_buf,
+                    &arena.as_slice()[h.offset..h.offset + h.bytes as usize],
+                    stream,
+                )?;
+                gpu.hip.event_record(&evt, Some(stream))?;
+            }
+            self.touch_host_lru(id);
+            let tensor = GpuTensor {
+                buf: device_buf,
+                shape: vec![range.len],
+                dtype: rdna_compute::DType::Raw,
+            };
+            self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
+            self.resident.insert(id, Resident { tensor, bytes: need });
+            self.lru.push_back(id);
+            let idx = self.transfer_events.len();
+            self.transfer_events.push(evt);
+            return Ok(TransferEventIdx(idx));
+        }
+
+        // Cold + host-miss — fall back to sync fetch.
+        let (tensor, _h) = self.transport.fetch(range.offset, range.len, gpu)?;
+        self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
+        self.resident.insert(id, Resident { tensor, bytes: need });
+        self.lru.push_back(id);
+        if self.config.trace {
+            eprintln!(
+                "[weight_pager] cold-load (async fallback) {id:?} ({} bytes)",
+                range.len
+            );
+        }
+        self.record_transfer_on_default_stream(gpu)
+    }
+
     /// Populate the pinned-host tier for `id` without touching the GPU.
     /// Used at warmup to pre-fill the host cache so first-touch
     /// promotions to VRAM are PCIe-bound, not NVMe-bound. No-op if the

@@ -2233,17 +2233,48 @@ fn qwen35_paged_moe_dispatch(
     let layer = ffn.layer_idx;
 
     // Step 1+2: ensure each active expert resident, then patch ptr table.
+    // v0.3-γ: when the pager has a pinned host arena, batch the 16
+    // (8 experts × 2 roles) ensure_resident calls into async memcpy
+    // ops on the transfer stream and wait collectively before the
+    // kernel launch. Cuts per-token-layer expert-fetch latency from
+    // 16× sync H2D to one batch — a meaningful win on cold-path MoE
+    // workloads where new expert activations dominate. Falls back to
+    // the sync loop on pageable arenas (where memcpy_htod_async is
+    // documented-sync per ROCm and would pay event overhead with no
+    // overlap to show for it).
     {
         let mut pager = pager_rc.borrow_mut();
-        for &idx in topk_indices {
-            pager.ensure_resident(
-                WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::GateUp },
-                gpu,
-            ).map_err(|e| hip_bridge::HipError::new(0, &format!("ensure_resident gate_up[{idx}] @ layer {layer}: {e}")))?;
-            pager.ensure_resident(
-                WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::Down },
-                gpu,
-            ).map_err(|e| hip_bridge::HipError::new(0, &format!("ensure_resident down[{idx}] @ layer {layer}: {e}")))?;
+        if pager.host_arena_pinned() {
+            let mut events = Vec::with_capacity(topk_indices.len() * 2);
+            for &idx in topk_indices {
+                events.push(pager.ensure_resident_async(
+                    WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::GateUp },
+                    gpu,
+                ).map_err(|e| hip_bridge::HipError::new(0, &format!(
+                    "ensure_resident_async gate_up[{idx}] @ layer {layer}: {e}"
+                )))?);
+                events.push(pager.ensure_resident_async(
+                    WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::Down },
+                    gpu,
+                ).map_err(|e| hip_bridge::HipError::new(0, &format!(
+                    "ensure_resident_async down[{idx}] @ layer {layer}: {e}"
+                )))?);
+            }
+            for e in events {
+                pager.wait_transfer(e, gpu).map_err(|err| hip_bridge::HipError::new(0,
+                    &format!("wait_transfer expert fill @ layer {layer}: {err}")))?;
+            }
+        } else {
+            for &idx in topk_indices {
+                pager.ensure_resident(
+                    WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::GateUp },
+                    gpu,
+                ).map_err(|e| hip_bridge::HipError::new(0, &format!("ensure_resident gate_up[{idx}] @ layer {layer}: {e}")))?;
+                pager.ensure_resident(
+                    WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::Down },
+                    gpu,
+                ).map_err(|e| hip_bridge::HipError::new(0, &format!("ensure_resident down[{idx}] @ layer {layer}: {e}")))?;
+            }
         }
         let active_u16: Vec<u16> = topk_indices.iter().map(|&i| i as u16).collect();
         pager.patch_expert_ptr_table(

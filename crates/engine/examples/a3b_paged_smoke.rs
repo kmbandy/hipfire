@@ -50,6 +50,13 @@ fn main() {
     } else {
         eprintln!("Pager VRAM budget: unlimited (no eviction)");
     }
+    if let Ok(s) = std::env::var("HIPFIRE_HOST_BUDGET_MB") {
+        let mb: u64 = s.parse().expect("HIPFIRE_HOST_BUDGET_MB must be a u64");
+        config.host_budget_bytes = mb * 1024 * 1024;
+        eprintln!("Host (pinned-RAM) tier budget: {mb} MB — engages v0.3-γ async batch when pinning succeeds");
+    } else {
+        eprintln!("Host (pinned-RAM) tier: disabled — set HIPFIRE_HOST_BUDGET_MB to engage async batch");
+    }
     eprintln!("A3B config: dim={}, layers={}, experts={}, top_k={}, moe_inter={}, shared_inter={}",
         config.dim, config.n_layers, config.num_experts, config.num_experts_per_tok,
         config.moe_intermediate_size, config.shared_expert_intermediate_size);
