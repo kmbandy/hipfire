@@ -802,19 +802,57 @@ impl WeightPager {
         Ok(())
     }
 
-    /// Allocate the host arena (lazy, on first prefetch). Sized to
-    /// `config.host_budget_bytes`. Tries pinned (`hipHostMalloc` with
-    /// the AMD `Coherent` flag) first; falls back to plain
-    /// `Vec<u8>` on any HIP error so the host tier keeps working
-    /// even when pinning is denied (typical when `RLIMIT_MEMLOCK` is
-    /// the stock 8 MB and the runtime falls back to `mlock`).
+    /// Allocate the host arena (lazy, on first prefetch). Tries pinned
+    /// (`hipHostMalloc` with the AMD `Coherent` flag) first; falls
+    /// back to plain `Vec<u8>` on any HIP error so the host tier keeps
+    /// working even when pinning is denied.
+    ///
+    /// **Pre-flight clamp**: AMD's Coherent allocation succeeds even
+    /// when there isn't actually that much RAM available — the
+    /// IOMMU-mapped pages are eligible for swap when the system is
+    /// pressured. So a request that's too big for the box's actual
+    /// headroom lands silently, then the moment we fault each page
+    /// the OS starts swapping out everything else and the whole
+    /// process grinds to a halt (~25 sec per "compute" step on a
+    /// 16 GB box). We read `MemAvailable` from `/proc/meminfo` and
+    /// clamp the request to leave a 2 GB safety margin for the
+    /// kernel + page cache + other processes.
     fn ensure_host_arena(&mut self, gpu: &mut Gpu) -> Result<(), WeightPagerError> {
         if self.host_arena.is_some() {
             return Ok(());
         }
-        let budget = self.config.host_budget_bytes as usize;
+        let mut budget = self.config.host_budget_bytes as usize;
         if budget == 0 {
             return Ok(());
+        }
+        // Pre-flight: clamp against actual system memory availability.
+        if let Some(avail) = read_mem_available() {
+            const SAFETY_MARGIN: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+            let safe_cap = avail.saturating_sub(SAFETY_MARGIN);
+            if budget > safe_cap {
+                eprintln!(
+                    "[weight_pager] host arena: requested {} MB but only {} MB available \
+                     (after 2 GB safety margin from /proc/meminfo MemAvailable={} MB) — \
+                     clamping to {} MB. Allocating beyond available RAM forces swap \
+                     thrashing on AMD Coherent (IOMMU-backed pages stay swappable). \
+                     Close other processes or raise system RAM for the full requested \
+                     budget.",
+                    budget / (1024 * 1024),
+                    safe_cap / (1024 * 1024),
+                    avail / (1024 * 1024),
+                    safe_cap / (1024 * 1024),
+                );
+                budget = safe_cap;
+                if budget == 0 {
+                    return Err(WeightPagerError::BudgetExhausted {
+                        need_bytes: self.config.host_budget_bytes,
+                        in_use: 0,
+                        budget: 0,
+                    });
+                }
+            }
+        } else if self.config.trace {
+            eprintln!("[weight_pager] could not read /proc/meminfo — skipping pre-flight clamp");
         }
         let t0 = std::time::Instant::now();
         // Try pinned (AMD Coherent — IOMMU-backed, bypasses
@@ -823,32 +861,30 @@ impl WeightPager {
         const HIP_HOST_MALLOC_COHERENT: u32 = 0x40000000;
         match gpu.hip.host_malloc_with_flags(budget, HIP_HOST_MALLOC_COHERENT) {
             Ok(buf) => {
-                if self.config.trace {
-                    eprintln!(
-                        "[weight_pager] host arena: allocated {} MB PINNED (Coherent) in {:.2}s — async overlap available",
-                        budget / (1024 * 1024),
-                        t0.elapsed().as_secs_f32(),
-                    );
-                }
+                eprintln!(
+                    "[weight_pager] host arena: allocated {} MB PINNED (Coherent) in {:.2}s — async overlap available",
+                    budget / (1024 * 1024),
+                    t0.elapsed().as_secs_f32(),
+                );
                 self.host_arena = Some(HostArena::Pinned(buf));
             }
             Err(e) => {
-                if self.config.trace {
-                    eprintln!(
-                        "[weight_pager] host arena: pinned alloc denied ({e}); falling back to pageable Vec<u8> — overlap loop will use sync path"
-                    );
-                }
+                eprintln!(
+                    "[weight_pager] host arena: pinned alloc denied ({e}); falling back to pageable Vec<u8> — overlap loop will use sync path"
+                );
                 let v = vec![0u8; budget];
-                if self.config.trace {
-                    eprintln!(
-                        "[weight_pager] host arena: allocated {} MB pageable in {:.2}s",
-                        budget / (1024 * 1024),
-                        t0.elapsed().as_secs_f32(),
-                    );
-                }
+                eprintln!(
+                    "[weight_pager] host arena: allocated {} MB pageable in {:.2}s",
+                    budget / (1024 * 1024),
+                    t0.elapsed().as_secs_f32(),
+                );
                 self.host_arena = Some(HostArena::Pageable(v));
             }
         }
+        // Update the effective budget so try_cold_load_into_host's
+        // overflow check uses the clamped value rather than the
+        // operator's request.
+        self.config.host_budget_bytes = budget as u64;
         Ok(())
     }
 
@@ -1368,6 +1404,23 @@ impl From<hip_bridge::HipError> for WeightPagerError {
 /// Forwarding helper so callers don't need a separate `use crate::hfq::HfqFile`.
 pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
     HfqFile::open(path)
+}
+
+/// Parse `/proc/meminfo` for the `MemAvailable:` field — bytes the
+/// kernel believes can be allocated to userspace right now without
+/// going to swap. Used by the pager's host-arena pre-flight to clamp
+/// outsized budgets before the OS starts thrashing. Returns `None` on
+/// non-Linux or any parse error (caller skips the clamp).
+fn read_mem_available() -> Option<usize> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // Format: "MemAvailable:    9258484 kB"
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.checked_mul(1024)?);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
