@@ -835,6 +835,20 @@ impl WeightPager {
     /// 16 GB box). We read `MemAvailable` from `/proc/meminfo` and
     /// clamp the request to leave a 2 GB safety margin for the
     /// kernel + page cache + other processes.
+    ///
+    /// **Opt-in `mlock`** (`HIPFIRE_PIN_HOST=1`): even with the
+    /// pre-flight clamp, Coherent pages stay swap-eligible because
+    /// the IOMMU mapping doesn't page-lock them. Under page-cache
+    /// pressure (e.g. a multi-GB model file `mmap`'d alongside our
+    /// arena) the kernel will silently swap out arena pages it
+    /// thinks are idle; subsequent `memcpy_htod_async` then page-
+    /// faults from disk-backed swap. Setting `HIPFIRE_PIN_HOST=1`
+    /// calls `mlock` on the arena right after allocation, making
+    /// the pages truly unswappable. Subject to `RLIMIT_MEMLOCK` —
+    /// if `mlock` returns `EPERM`/`ENOMEM` we log a clear error and
+    /// continue without pinning (arena still works, just swap-eligible).
+    /// Remediation: `ulimit -l unlimited` for the shell, or set
+    /// `* hard memlock unlimited` in `/etc/security/limits.conf`.
     fn ensure_host_arena(&mut self, gpu: &mut Gpu) -> Result<(), WeightPagerError> {
         if self.host_arena.is_some() {
             return Ok(());
@@ -884,6 +898,34 @@ impl WeightPager {
                     budget / (1024 * 1024),
                     t0.elapsed().as_secs_f32(),
                 );
+                if std::env::var_os("HIPFIRE_PIN_HOST").is_some() {
+                    let t_mlock = std::time::Instant::now();
+                    // SAFETY: buf.as_ptr() points at `buf.size()` bytes of
+                    // valid Coherent host memory we just allocated. mlock
+                    // is read-only against the buffer contents (it walks
+                    // page tables and pins them).
+                    let rc = unsafe {
+                        libc::mlock(buf.as_ptr() as *const libc::c_void, buf.size())
+                    };
+                    if rc == 0 {
+                        eprintln!(
+                            "[weight_pager] host arena: mlock'd {} MB in {:.2}s — \
+                             arena is now unswappable",
+                            buf.size() / (1024 * 1024),
+                            t_mlock.elapsed().as_secs_f32(),
+                        );
+                    } else {
+                        let errno = std::io::Error::last_os_error();
+                        eprintln!(
+                            "[weight_pager] host arena: mlock denied ({errno}) — arena \
+                             stays swap-eligible. Remediation: `ulimit -l unlimited` in \
+                             this shell, or `* hard memlock unlimited` in \
+                             /etc/security/limits.conf (then re-login). Continuing \
+                             without pin — under heavy page-cache pressure (e.g. large \
+                             mmap'd model file), expect occasional swap-fault stalls."
+                        );
+                    }
+                }
                 self.host_arena = Some(HostArena::Pinned(buf));
             }
             Err(e) => {
