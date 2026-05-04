@@ -367,16 +367,20 @@ pub enum LayerWeights {
 /// In `paged_dense` mode all layers' `w_gate`/`w_up`/`w_down` are
 /// non-owning views into these three buffers. Before each layer's FFN
 /// compute the pager refills the scratch with that layer's bytes via
-/// `pager.fill_into`. Single-buffered so no overlap (v0.3 will pair
-/// dedicated streams + double-buffering for that win).
+/// `pager.fill_into` (sync) or `pager.fill_into_async` (v0.3-β async
+/// overlap). Each role has **two** GpuTensor slots so the forward path
+/// can ping-pong: layer N reads `gate[N&1]` while transfer stream
+/// writes `gate[(N+1)&1]` for the next layer.
 ///
 /// Sized to the max per-layer FFN matrix the loader observed; for
 /// uniform-shape transformers (Qwen3.5/3.6) every layer uses the full
-/// allocation.
+/// allocation. Doubling memory cost is ~135 MB extra on Qwen3.6-27B —
+/// a trivial fraction of the VRAM budget on any card big enough to
+/// run paged dense at all.
 pub struct DenseScratch {
-    pub gate: GpuTensor,
-    pub up: GpuTensor,
-    pub down: GpuTensor,
+    pub gate: [GpuTensor; 2],
+    pub up: [GpuTensor; 2],
+    pub down: [GpuTensor; 2],
     /// Cached metadata so the dispatch site can build `WeightTensor`
     /// views with correct m / k. Per-role since gate and up share shape
     /// but down is transposed.
@@ -512,9 +516,15 @@ impl Qwen35Weights {
         // a free-then-deref is undefined behavior even though hip_free
         // doesn't touch the alias's GpuTensor wrapper.
         if let Some(scratch) = self.dense_scratch {
-            let _ = gpu.free_tensor(scratch.gate);
-            let _ = gpu.free_tensor(scratch.up);
-            let _ = gpu.free_tensor(scratch.down);
+            let [g0, g1] = scratch.gate;
+            let [u0, u1] = scratch.up;
+            let [d0, d1] = scratch.down;
+            let _ = gpu.free_tensor(g0);
+            let _ = gpu.free_tensor(g1);
+            let _ = gpu.free_tensor(u0);
+            let _ = gpu.free_tensor(u1);
+            let _ = gpu.free_tensor(d0);
+            let _ = gpu.free_tensor(d1);
         }
         // MAD-93: in paged mode, the pager owns expert weight allocations
         // (the per-layer `free_moe_ffn` loops ran no-ops since `ffn.experts`
@@ -1373,13 +1383,26 @@ fn load_dense_ffn(
                  doesn't support yet.",
                 gate_info.quant_type
             )))?;
-        let gate_buf = gpu.hip.malloc(gate_info.data_size)?;
-        let up_buf   = gpu.hip.malloc(up_info.data_size)?;
-        let down_buf = gpu.hip.malloc(down_info.data_size)?;
+        // v0.3-β: two slots per role for ping-pong overlap.
+        let gate_buf_0 = gpu.hip.malloc(gate_info.data_size)?;
+        let gate_buf_1 = gpu.hip.malloc(gate_info.data_size)?;
+        let up_buf_0   = gpu.hip.malloc(up_info.data_size)?;
+        let up_buf_1   = gpu.hip.malloc(up_info.data_size)?;
+        let down_buf_0 = gpu.hip.malloc(down_info.data_size)?;
+        let down_buf_1 = gpu.hip.malloc(down_info.data_size)?;
         *dense_scratch = Some(DenseScratch {
-            gate: GpuTensor { buf: gate_buf, shape: vec![gate_info.data_size], dtype: DType::Raw },
-            up:   GpuTensor { buf: up_buf,   shape: vec![up_info.data_size],   dtype: DType::Raw },
-            down: GpuTensor { buf: down_buf, shape: vec![down_info.data_size], dtype: DType::Raw },
+            gate: [
+                GpuTensor { buf: gate_buf_0, shape: vec![gate_info.data_size], dtype: DType::Raw },
+                GpuTensor { buf: gate_buf_1, shape: vec![gate_info.data_size], dtype: DType::Raw },
+            ],
+            up: [
+                GpuTensor { buf: up_buf_0, shape: vec![up_info.data_size], dtype: DType::Raw },
+                GpuTensor { buf: up_buf_1, shape: vec![up_info.data_size], dtype: DType::Raw },
+            ],
+            down: [
+                GpuTensor { buf: down_buf_0, shape: vec![down_info.data_size], dtype: DType::Raw },
+                GpuTensor { buf: down_buf_1, shape: vec![down_info.data_size], dtype: DType::Raw },
+            ],
             gate_m: config.hidden_dim,
             gate_k: config.dim,
             down_m: config.dim,
@@ -1414,10 +1437,13 @@ fn load_dense_ffn(
     // read `layer.w_gate.buf` etc. exactly as before — paged or not — because
     // these views point at the same memory the scratch owns. `free_gpu`
     // skips freeing these (the scratch owns the underlying VRAM).
+    // Layer aliases initially point at slot 0. The forward path
+    // rebinds them each layer to scratch.{gate,up,down}[layer & 1] via
+    // `rebind_dense_layer_alias` before the per-layer compute issues.
     let gate_view = WeightTensor {
         buf: GpuTensor {
             buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(scratch.gate.buf.as_ptr(), scratch.gate_bytes)
+                hip_bridge::DeviceBuffer::from_raw(scratch.gate[0].buf.as_ptr(), scratch.gate_bytes)
             },
             shape: vec![scratch.gate_bytes],
             dtype: DType::Raw,
@@ -1430,7 +1456,7 @@ fn load_dense_ffn(
     let up_view = WeightTensor {
         buf: GpuTensor {
             buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(scratch.up.buf.as_ptr(), scratch.up_bytes)
+                hip_bridge::DeviceBuffer::from_raw(scratch.up[0].buf.as_ptr(), scratch.up_bytes)
             },
             shape: vec![scratch.up_bytes],
             dtype: DType::Raw,
@@ -1443,7 +1469,7 @@ fn load_dense_ffn(
     let down_view = WeightTensor {
         buf: GpuTensor {
             buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(scratch.down.buf.as_ptr(), scratch.down_bytes)
+                hip_bridge::DeviceBuffer::from_raw(scratch.down[0].buf.as_ptr(), scratch.down_bytes)
             },
             shape: vec![scratch.down_bytes],
             dtype: DType::Raw,
@@ -1456,16 +1482,13 @@ fn load_dense_ffn(
     Ok((gate_view, up_view, down_view))
 }
 
-/// Refill the dense-FFN scratch buffers with `layer_idx`'s bytes via the
-/// pager (MAD-94 v0.2). No-op when not in paged_dense mode.
-///
-/// Called at the start of each layer's compute in the forward path. Takes
-/// `&Qwen35Weights` so it can borrow_mut the pager's `RefCell` without
-/// requiring forward to take `&mut Qwen35Weights`. Cheap when paged is off
-/// (one None-check) so call sites can do it unconditionally.
+/// Refill the dense-FFN scratch slot `slot` with `layer_idx`'s bytes
+/// via the pager. **Synchronous** — used to bootstrap the first layer
+/// before the overlap loop. No-op when not in paged_dense mode.
 fn pager_fill_dense_ffn_layer(
     weights: &Qwen35Weights,
     layer_idx: u16,
+    slot: usize,
     gpu: &mut Gpu,
 ) -> HipResult<()> {
     let (Some(scratch), Some(pager_rc)) = (&weights.dense_scratch, &weights.pager) else {
@@ -1475,17 +1498,77 @@ fn pager_fill_dense_ffn_layer(
     let mut pager = pager_rc.borrow_mut();
     pager.fill_into(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Gate },
-        &scratch.gate, gpu,
-    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged fill gate L{layer_idx}: {e}")))?;
+        &scratch.gate[slot], gpu,
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged fill gate L{layer_idx}/s{slot}: {e}")))?;
     pager.fill_into(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Up },
-        &scratch.up, gpu,
-    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged fill up L{layer_idx}: {e}")))?;
+        &scratch.up[slot], gpu,
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged fill up L{layer_idx}/s{slot}: {e}")))?;
     pager.fill_into(
         WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Down },
-        &scratch.down, gpu,
-    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged fill down L{layer_idx}: {e}")))?;
+        &scratch.down[slot], gpu,
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged fill down L{layer_idx}/s{slot}: {e}")))?;
     Ok(())
+}
+
+/// Async version: enqueue the three fills for `layer_idx`'s bytes
+/// onto the pager's transfer stream and return the three event idxs.
+/// Forward path overlaps these with compute on the default stream;
+/// `wait_transfer` synchronizes before the next layer reads the slot.
+/// No-op when not in paged_dense mode (returns empty Vec).
+fn pager_dense_async_prefetch_layer(
+    weights: &Qwen35Weights,
+    layer_idx: u16,
+    slot: usize,
+    gpu: &mut Gpu,
+) -> HipResult<Vec<crate::weight_pager::TransferEventIdx>> {
+    let (Some(scratch), Some(pager_rc)) = (&weights.dense_scratch, &weights.pager) else {
+        return Ok(Vec::new());
+    };
+    use crate::weight_pager::{FfnRole, WeightId};
+    let mut pager = pager_rc.borrow_mut();
+    let g = pager.fill_into_async(
+        WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Gate },
+        &scratch.gate[slot], gpu,
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill gate L{layer_idx}/s{slot}: {e}")))?;
+    let u = pager.fill_into_async(
+        WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Up },
+        &scratch.up[slot], gpu,
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill up L{layer_idx}/s{slot}: {e}")))?;
+    let d = pager.fill_into_async(
+        WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Down },
+        &scratch.down[slot], gpu,
+    ).map_err(|e| hip_bridge::HipError::new(0, &format!("paged async fill down L{layer_idx}/s{slot}: {e}")))?;
+    Ok(vec![g, u, d])
+}
+
+/// Build a `WeightTensor` view that aliases `slot_buf` with the metadata
+/// of `layer_w` (m / k / gpu_dtype / row_stride). The returned tensor
+/// is non-owning — it lives on the stack, the underlying VRAM is owned
+/// by `DenseScratch`. Used by the v0.3-β paged-dense forward to
+/// substitute the active scratch slot at each FFN dispatch site
+/// without mutating the layer's persistent alias (which the compiler
+/// rightly assumes immutable through `&T`).
+///
+/// `shape: Vec::new()` is intentional — FFN kernels read `m`/`k`
+/// directly from `WeightTensor`, never `.buf.shape`. Avoids the
+/// per-layer Vec allocation that a real shape would force.
+fn build_paged_dense_alias(
+    layer_w: &WeightTensor,
+    slot_buf: &GpuTensor,
+    bytes: usize,
+) -> WeightTensor {
+    WeightTensor {
+        buf: GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(slot_buf.buf.as_ptr(), bytes) },
+            shape: Vec::new(),
+            dtype: DType::Raw,
+        },
+        gpu_dtype: layer_w.gpu_dtype,
+        m: layer_w.m,
+        k: layer_w.k,
+        row_stride: layer_w.row_stride,
+    }
 }
 
 fn load_moe_ffn(
@@ -5369,11 +5452,82 @@ fn forward_scratch_layers(
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
 
+    // MAD-95 v0.3-β: paged-dense overlap state. When paged_dense is on
+    // we run a 2-slot ping-pong: layer N reads scratch[N&1] while
+    // transfer stream writes scratch[(N+1)&1] in parallel.
+    //
+    // Per-layer flow:
+    //   1. Wait on this layer's transfer event (if previously prefetched).
+    //   2. Build stack-local WeightTensor aliases pointing at scratch[active_slot].
+    //   3. Issue compute kernels (default stream).
+    //   4. Record compute event for active_slot.
+    //   5. Kick off async prefetch for layer N+1 → scratch[(N+1)&1],
+    //      transfer stream waits on compute_evt_for_slot[(N+1)&1] (the
+    //      compute that last consumed that slot, 2 layers ago).
+    //
+    // The bootstrap for layer 0 issues async prefetch before the loop.
+    // Real overlap requires pinned host memory (`hipHostMalloc`
+    // Coherent) because pageable-source `hipMemcpyAsync` is
+    // documented-sync per ROCm — paying event-overhead on pageable
+    // arenas with no parallelism is a strict regression. The pager
+    // tries pinned first and falls back to pageable; we mirror by
+    // engaging overlap only when pinned is actually available.
+    let dense_paged = weights.dense_scratch.is_some();
+    let pager_pinned = weights.pager.as_ref()
+        .map(|p| p.borrow().host_arena_pinned())
+        .unwrap_or(false);
+    let async_overlap = dense_paged && pager_pinned;
+    let mut pending_prefetch: Option<Vec<crate::weight_pager::TransferEventIdx>> = None;
+    let mut compute_evt_for_slot: [Option<hip_bridge::Event>; 2] = [None, None];
+    if async_overlap && config.n_layers > 0 {
+        pending_prefetch = Some(pager_dense_async_prefetch_layer(weights, 0, 0, gpu)?);
+    }
+
     for layer_idx in 0..config.n_layers {
-        // MAD-94: refill dense FFN scratch from pager (no-op if not paged_dense).
-        // Done once per layer at the top — both DeltaNet and FullAttn dense
-        // arms read w_gate/w_up/w_down via the scratch alias.
-        pager_fill_dense_ffn_layer(weights, layer_idx as u16, gpu)?;
+        let active_slot = layer_idx & 1;
+
+        if async_overlap {
+            // (overlap path) Wait for THIS layer's prefetch.
+            if let Some(events) = pending_prefetch.take() {
+                if let Some(pager_rc) = &weights.pager {
+                    let mut pager = pager_rc.borrow_mut();
+                    for e in events {
+                        pager.wait_transfer(e, gpu).map_err(|e| {
+                            hip_bridge::HipError::new(0, &format!("wait_transfer L{layer_idx}: {e}"))
+                        })?;
+                    }
+                }
+            }
+        } else {
+            // (sync path) v0.3-α / v0.2 single-slot fill. No-op when
+            // dense_scratch is None. Used when pinning is unavailable
+            // (RLIMIT_MEMLOCK denied) so we don't pay async overhead
+            // for fake-async copies.
+            pager_fill_dense_ffn_layer(weights, layer_idx as u16, 0, gpu)?;
+        }
+
+        // Build stack-local FFN aliases pointing at the active slot.
+        // Only meaningful in overlap mode (sync path always uses slot
+        // 0 which the layer's persistent alias already points at).
+        let paged_dense_aliases: Option<(WeightTensor, WeightTensor, WeightTensor)> =
+            if async_overlap {
+                let scratch = weights.dense_scratch.as_ref().unwrap();
+                let (w_gate_meta, w_up_meta, w_down_meta) = match &weights.layers[layer_idx] {
+                    LayerWeights::DeltaNet(l) => (&l.w_gate, &l.w_up, &l.w_down),
+                    LayerWeights::FullAttn(l) => (&l.w_gate, &l.w_up, &l.w_down),
+                    LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {
+                        return Err(hip_bridge::HipError::new(0,
+                            "paged_dense layer expected DeltaNet/FullAttn dense, got MoE"));
+                    }
+                };
+                Some((
+                    build_paged_dense_alias(w_gate_meta, &scratch.gate[active_slot], scratch.gate_bytes),
+                    build_paged_dense_alias(w_up_meta,   &scratch.up[active_slot],   scratch.up_bytes),
+                    build_paged_dense_alias(w_down_meta, &scratch.down[active_slot], scratch.down_bytes),
+                ))
+            } else {
+                None
+            };
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // Fused RMSNorm + FWHT rotation (Phase 3.6). For MQ4 weights this
@@ -5491,35 +5645,43 @@ fn forward_scratch_layers(
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
+                // (paged_dense) Substitute the layer's persistent
+                // alias with the active scratch slot's stack-local
+                // alias. The rest of the FFN reads `eff_w_*`.
+                let (eff_w_gate, eff_w_up, eff_w_down) = if let Some((g, u, d)) = paged_dense_aliases.as_ref() {
+                    (g, u, d)
+                } else {
+                    (&layer.w_gate, &layer.w_up, &layer.w_down)
+                };
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu, eff_w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
-                let dt_g = layer.w_gate.gpu_dtype;
+                let dt_g = eff_w_gate.gpu_dtype;
                 let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
-                    && layer.w_up.gpu_dtype == dt_g;
+                    && eff_w_up.gpu_dtype == dt_g;
                 if fused_gu_ok {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_hfq4g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &eff_w_gate.buf, &eff_w_up.buf,
                         eff_x,
                         &s.gate_ffn, &s.up,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k,
+                        eff_w_gate.m, eff_w_up.m,
+                        eff_w_gate.k,
                     )?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-                    weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                    weight_gemv_prerotated(gpu, eff_w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    weight_gemv_prerotated(gpu, eff_w_up, &s.tmp, x_rot, &s.up)?;
                 }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 weight_gemv_swiglu_residual(
-                    gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                    gpu, eff_w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
                 )?;
 
                 if let Some(ref rb) = hidden_rb {
@@ -5677,35 +5839,42 @@ fn forward_scratch_layers(
                 weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
+                // (paged_dense) Substitute layer aliases with active
+                // scratch slot — see DeltaNet arm above for rationale.
+                let (eff_w_gate, eff_w_up, eff_w_down) = if let Some((g, u, d)) = paged_dense_aliases.as_ref() {
+                    (g, u, d)
+                } else {
+                    (&layer.w_gate, &layer.w_up, &layer.w_down)
+                };
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu, eff_w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
-                let dt_g = layer.w_gate.gpu_dtype;
+                let dt_g = eff_w_gate.gpu_dtype;
                 let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
-                    && layer.w_up.gpu_dtype == dt_g;
+                    && eff_w_up.gpu_dtype == dt_g;
                 if fused_gu_ok {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_hfq4g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &eff_w_gate.buf, &eff_w_up.buf,
                         eff_x,
                         &s.gate_ffn, &s.up,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k,
+                        eff_w_gate.m, eff_w_up.m,
+                        eff_w_gate.k,
                     )?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-                    weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                    weight_gemv_prerotated(gpu, eff_w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    weight_gemv_prerotated(gpu, eff_w_up, &s.tmp, x_rot, &s.up)?;
                 }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 weight_gemv_swiglu_residual(
-                    gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                    gpu, eff_w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
                 )?;
 
                 if let Some(ref rb) = hidden_rb {
@@ -5987,6 +6156,48 @@ fn forward_scratch_layers(
             }
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+
+        // (overlap path) Post-compute: record event so the slot-reuse
+        // hazard guard works, then issue the next layer's prefetch.
+        if async_overlap && layer_idx + 1 < config.n_layers {
+            let next_slot = (layer_idx + 1) & 1;
+            // Record compute event for THIS slot, on the default
+            // stream (None). Fires once layer N's compute kernels
+            // finish reading scratch[active_slot].
+            let compute_evt = gpu.hip.event_create()?;
+            gpu.hip.event_record(&compute_evt, None)?;
+            if let Some(old) = compute_evt_for_slot[active_slot].take() {
+                let _ = gpu.hip.event_destroy(old);
+            }
+            compute_evt_for_slot[active_slot] = Some(compute_evt);
+
+            // Slot-reuse defense: prefetch into next_slot must wait
+            // for the compute that last read next_slot — which with
+            // 2 slots and 1-layer lookahead is layer N-1.
+            if let Some(pager_rc) = &weights.pager {
+                let mut pager = pager_rc.borrow_mut();
+                if let Some(prev_compute) = compute_evt_for_slot[next_slot].as_ref() {
+                    pager.transfer_wait_for_compute(prev_compute, gpu).map_err(|e| {
+                        hip_bridge::HipError::new(0, &format!(
+                            "transfer_wait_for_compute slot {next_slot}: {e}"
+                        ))
+                    })?;
+                }
+            }
+            pending_prefetch = Some(pager_dense_async_prefetch_layer(
+                weights,
+                (layer_idx + 1) as u16,
+                next_slot,
+                gpu,
+            )?);
+        }
+    }
+    if async_overlap {
+        for slot_evt in compute_evt_for_slot.iter_mut() {
+            if let Some(e) = slot_evt.take() {
+                let _ = gpu.hip.event_destroy(e);
+            }
         }
     }
     let _ = &mut hidden_rb; // silence unused mut warning on paths where the branch never writes

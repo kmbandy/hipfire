@@ -450,17 +450,18 @@ pub struct WeightPager {
     host_resident: HashMap<WeightId, HostResident>,
     /// One big shared arena for every host-resident weight. Allocated
     /// lazily on first prefetch — sized to `config.host_budget_bytes`.
-    /// A contiguous bump arena is correct because v0.3-α only supports
-    /// the "host budget ≥ total paged weights" regime (no eviction;
-    /// warmup → permanent residency).
+    /// A contiguous bump arena is correct because the v0.3 host tier
+    /// only supports the "host budget ≥ working-set" regime (no
+    /// eviction; warmup → opportunistic permanent residency).
     ///
-    /// **Unpinned** today (plain `Vec<u8>`) — pinned (`hipHostMalloc`)
-    /// would unlock ~5× faster H2D copies (~25 GB/s vs ~5 GB/s on
-    /// PCIe 4.0) but requires `RLIMIT_MEMLOCK` to be raised above the
-    /// 8 MB Linux default, which most users haven't done. The host
-    /// tier still wins because it skips the NVMe re-read on every
-    /// page-in; pinned is the v0.3-β polish on top of that.
-    host_arena: Option<Vec<u8>>,
+    /// Tries pinned (`hipHostMalloc` with the AMD `Coherent` flag,
+    /// which uses IOMMU mapping rather than `mlock` and bypasses
+    /// `RLIMIT_MEMLOCK`) first; falls back to a pageable `Vec<u8>`
+    /// when ROCm refuses pinning. **Pinned is required for actual
+    /// async overlap** — `hipMemcpyAsync` from pageable host memory
+    /// is documented-sync per AMD, so the v0.3-β async forward path
+    /// only delivers parallelism with a pinned arena.
+    host_arena: Option<HostArena>,
     /// LRU queue for the host tier — kept for forward compatibility
     /// with v0.3-β eviction, but not consulted today.
     host_lru: VecDeque<WeightId>,
@@ -525,6 +526,40 @@ struct Resident {
     tensor: GpuTensor,
     /// Cached byte length so eviction can update `vram_used_bytes` cheaply.
     bytes: u64,
+}
+
+/// Big shared arena for the host tier. Tagged so callers can tell
+/// pinned (DMA-fast, async-capable) from pageable (sync-only) and
+/// switch the forward-path overlap loop on/off accordingly.
+enum HostArena {
+    /// `hipHostMalloc`-backed pinned region. `hipMemcpyAsync` from
+    /// here is genuinely asynchronous and runs at ~25 GB/s on PCIe
+    /// 4.0; required for the v0.3-β compute/transfer overlap loop.
+    Pinned(hip_bridge::HostBuffer),
+    /// Plain heap-allocated bytes. Works as a disk-skip cache but
+    /// `hipMemcpyAsync` is documented-sync from here — the forward
+    /// path falls back to the v0.3-α single-slot sync fill in this
+    /// mode rather than paying the event-create overhead with no
+    /// overlap to show for it.
+    Pageable(Vec<u8>),
+}
+
+impl HostArena {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            HostArena::Pinned(b) => b.as_slice(),
+            HostArena::Pageable(v) => v.as_slice(),
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            HostArena::Pinned(b) => b.as_mut_slice(),
+            HostArena::Pageable(v) => v.as_mut_slice(),
+        }
+    }
+    fn is_pinned(&self) -> bool {
+        matches!(self, HostArena::Pinned(_))
+    }
 }
 
 /// A pinned-host (page-locked) shadow copy of a paged weight. Backs the
@@ -632,7 +667,7 @@ impl WeightPager {
                 let arena = self.host_arena.as_ref().expect(
                     "host_resident populated without host_arena — pager invariant",
                 );
-                gpu.upload_raw(&arena[h.offset..h.offset + h.bytes as usize], &[range.len])?
+                gpu.upload_raw(&arena.as_slice()[h.offset..h.offset + h.bytes as usize], &[range.len])?
             };
             self.touch_host_lru(id);
             if self.config.trace {
@@ -685,9 +720,12 @@ impl WeightPager {
     }
 
     /// Allocate the host arena (lazy, on first prefetch). Sized to
-    /// `config.host_budget_bytes`. Plain heap memory — see the field
-    /// comment for why we don't pin in v0.3-α.
-    fn ensure_host_arena(&mut self, _gpu: &mut Gpu) -> Result<(), WeightPagerError> {
+    /// `config.host_budget_bytes`. Tries pinned (`hipHostMalloc` with
+    /// the AMD `Coherent` flag) first; falls back to plain
+    /// `Vec<u8>` on any HIP error so the host tier keeps working
+    /// even when pinning is denied (typical when `RLIMIT_MEMLOCK` is
+    /// the stock 8 MB and the runtime falls back to `mlock`).
+    fn ensure_host_arena(&mut self, gpu: &mut Gpu) -> Result<(), WeightPagerError> {
         if self.host_arena.is_some() {
             return Ok(());
         }
@@ -696,16 +734,48 @@ impl WeightPager {
             return Ok(());
         }
         let t0 = std::time::Instant::now();
-        let buf = vec![0u8; budget];
-        if self.config.trace {
-            eprintln!(
-                "[weight_pager] host arena: allocated {} MB unpinned in {:.2}s",
-                budget / (1024 * 1024),
-                t0.elapsed().as_secs_f32(),
-            );
+        // Try pinned (AMD Coherent — IOMMU-backed, bypasses
+        // RLIMIT_MEMLOCK on systems with USM). Fall back to pageable
+        // on any HIP error rather than aborting the load.
+        const HIP_HOST_MALLOC_COHERENT: u32 = 0x40000000;
+        match gpu.hip.host_malloc_with_flags(budget, HIP_HOST_MALLOC_COHERENT) {
+            Ok(buf) => {
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] host arena: allocated {} MB PINNED (Coherent) in {:.2}s — async overlap available",
+                        budget / (1024 * 1024),
+                        t0.elapsed().as_secs_f32(),
+                    );
+                }
+                self.host_arena = Some(HostArena::Pinned(buf));
+            }
+            Err(e) => {
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] host arena: pinned alloc denied ({e}); falling back to pageable Vec<u8> — overlap loop will use sync path"
+                    );
+                }
+                let v = vec![0u8; budget];
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] host arena: allocated {} MB pageable in {:.2}s",
+                        budget / (1024 * 1024),
+                        t0.elapsed().as_secs_f32(),
+                    );
+                }
+                self.host_arena = Some(HostArena::Pageable(v));
+            }
         }
-        self.host_arena = Some(buf);
         Ok(())
+    }
+
+    /// `true` once the host arena is allocated AND backed by pinned
+    /// memory. The forward path checks this before engaging the v0.3-β
+    /// overlap loop — `hipMemcpyAsync` from pageable host is sync, so
+    /// running the overlap loop without pinning costs event overhead
+    /// for nothing.
+    pub fn host_arena_pinned(&self) -> bool {
+        matches!(&self.host_arena, Some(a) if a.is_pinned())
     }
 
     /// **Opportunistic** host-tier population: read `range` from disk
@@ -738,7 +808,7 @@ impl WeightPager {
             self.transport.read_to_host(
                 range.offset,
                 range.len,
-                &mut arena[offset..offset + range.len],
+                &mut arena.as_mut_slice()[offset..offset + range.len],
             )?;
         }
         self.host_used_bytes = self.host_used_bytes.saturating_add(need);
@@ -869,7 +939,7 @@ impl WeightPager {
             );
             gpu.hip.memcpy_htod_async(
                 &dst.buf,
-                &arena[h.offset..h.offset + h.bytes as usize],
+                &arena.as_slice()[h.offset..h.offset + h.bytes as usize],
                 stream,
             )?;
             gpu.hip.event_record(&evt, Some(stream))?;
@@ -913,8 +983,31 @@ impl WeightPager {
         gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
         if self.transfer_stream.is_none() {
-            self.transfer_stream = Some(gpu.hip.stream_create()?);
+            // Non-blocking is mandatory for actual compute/transfer
+            // overlap. The default hipStreamCreate would implicitly
+            // serialize against the default stream and we'd see the
+            // event-overhead with none of the overlap benefit.
+            self.transfer_stream = Some(gpu.hip.stream_create_nonblocking()?);
         }
+        Ok(())
+    }
+
+    /// Make the pager's transfer stream wait on a compute event before
+    /// proceeding with any subsequently-enqueued async transfer. Used
+    /// by the forward path's overlap loop to defend against the
+    /// 2-slot-reuse hazard: when prefetching for slot S that was last
+    /// read by compute layer N-1, the transfer stream must wait on
+    /// compute_event[N-1] so it doesn't overwrite bytes still being
+    /// consumed by an in-flight kernel. Lazily creates the transfer
+    /// stream if not yet allocated.
+    pub fn transfer_wait_for_compute(
+        &mut self,
+        compute_event: &hip_bridge::Event,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        self.ensure_transfer_stream(gpu)?;
+        let stream = self.transfer_stream.as_ref().unwrap();
+        gpu.hip.stream_wait_event(stream, compute_event)?;
         Ok(())
     }
 
@@ -1056,8 +1149,11 @@ impl WeightPager {
         self.host_resident.clear();
         self.host_lru.clear();
         self.host_used_bytes = 0;
-        // Vec<u8> arena drops naturally via take().
-        let _ = self.host_arena.take();
+        // Pinned arena needs hipHostFree; pageable just drops.
+        match self.host_arena.take() {
+            Some(HostArena::Pinned(buf)) => { let _ = gpu.hip.host_free(buf); }
+            Some(HostArena::Pageable(_)) | None => {}
+        }
         // Tear down the transfer stream + drain any lingering events.
         // Sync first (waits for any in-flight copy) so destroying the
         // event objects doesn't yank state out from under the GPU.
@@ -1112,7 +1208,7 @@ impl WeightPager {
                 );
                 gpu.hip.memcpy_htod(
                     &dst.buf,
-                    &arena[h.offset..h.offset + h.bytes as usize],
+                    &arena.as_slice()[h.offset..h.offset + h.bytes as usize],
                 )?;
             }
             self.touch_host_lru(id);
