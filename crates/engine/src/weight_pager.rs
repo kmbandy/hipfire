@@ -450,9 +450,9 @@ pub struct WeightPager {
     host_resident: HashMap<WeightId, HostResident>,
     /// One big shared arena for every host-resident weight. Allocated
     /// lazily on first prefetch — sized to `config.host_budget_bytes`.
-    /// A contiguous bump arena is correct because the v0.3 host tier
-    /// only supports the "host budget ≥ working-set" regime (no
-    /// eviction; warmup → opportunistic permanent residency).
+    /// Carved into per-size slots by [`Self::host_pools`] +
+    /// [`Self::host_high_water`]; the arena buffer itself never
+    /// reallocates after `ensure_host_arena`.
     ///
     /// Tries pinned (`hipHostMalloc` with the AMD `Coherent` flag,
     /// which uses IOMMU mapping rather than `mlock` and bypasses
@@ -462,12 +462,28 @@ pub struct WeightPager {
     /// is documented-sync per AMD, so the v0.3-β async forward path
     /// only delivers parallelism with a pinned arena.
     host_arena: Option<HostArena>,
-    /// LRU queue for the host tier — kept for forward compatibility
-    /// with v0.3-β eviction, but not consulted today.
+    /// LRU queue for the host tier. Front = least-recently-used eviction
+    /// victim; back = most-recently-touched. Consulted by
+    /// [`Self::evict_one_host_lru`] when an allocation can neither be
+    /// satisfied from a same-size pool slot nor carved from the tail.
     host_lru: VecDeque<WeightId>,
-    /// Bytes currently held by `host_resident`. Doubles as the
-    /// bump-arena cursor: next allocation lands at `host_arena[host_used_bytes..]`.
+    /// Bytes currently held by live `host_resident` entries. **Logical
+    /// occupancy**, not the arena cursor — freed pool slots are
+    /// subtracted on eviction, so this is the honest "how much host
+    /// RAM is in active use" number returned by [`Self::host_used_bytes`].
     host_used_bytes: u64,
+    /// Size-class free lists: `byte_size → free_offsets`. When a host
+    /// slot is evicted, its arena offset goes here under the slot's
+    /// byte size; the next allocation of that exact size pops from the
+    /// list instead of carving fresh tail space. Hipfire's MoE-dominated
+    /// paged workload is uniform-shape per (layer, role), so same-size
+    /// reuse is the dominant path.
+    host_pools: HashMap<usize, Vec<usize>>,
+    /// Bump cursor for first-time slot creation. Grows monotonically
+    /// (never recedes — pool slots handle reuse). When
+    /// `host_high_water + need > arena_cap` and there's no matching
+    /// pool entry, the allocator evicts an LRU slot and retries.
+    host_high_water: usize,
     /// Dedicated GPU stream for async H2D transfers (v0.3-β). Distinct
     /// from the compute stream so transfer for layer N+1 can run
     /// concurrently with compute on layer N. Allocated lazily on first
@@ -589,6 +605,8 @@ impl WeightPager {
             host_arena: None,
             host_lru: VecDeque::new(),
             host_used_bytes: 0,
+            host_pools: HashMap::new(),
+            host_high_water: 0,
             transfer_stream: None,
             transfer_events: Vec::new(),
             catalog: HashMap::new(),
@@ -897,16 +915,32 @@ impl WeightPager {
         matches!(&self.host_arena, Some(a) if a.is_pinned())
     }
 
-    /// **Opportunistic** host-tier population: read `range` from disk
-    /// into the next free slot in the host arena and record residency.
-    /// Returns `Ok(true)` if the weight got cached, `Ok(false)` if the
-    /// arena was full (caller falls back to disk on every page-in for
-    /// this weight). Pure no-op when the host tier is disabled.
+    /// Slab-allocated host-tier population: read `range` from disk into
+    /// a host arena slot and record residency. Returns `Ok(true)` if
+    /// the weight got cached, `Ok(false)` only as the final escape
+    /// hatch (host tier disabled, single weight bigger than the entire
+    /// budget, or pathological size-mix saturation — see below). Pure
+    /// no-op when the host tier is disabled.
     ///
-    /// "Opportunistic" rather than "must-fit" because the bump arena
-    /// has no eviction in v0.3-α — once full, new weights bypass the
-    /// host tier entirely. Lets the user set `host_budget_bytes` below
-    /// the catalog total without crashing the forward pass.
+    /// **Slot acquisition order** (v0.3-δ):
+    /// 1. **Pool hit** — reuse a free slot of the exact byte size left
+    ///    behind by a prior eviction. Dominant path for MoE workloads
+    ///    where every (layer, role) shares a size.
+    /// 2. **Tail carve** — bump `host_high_water` if the arena tail
+    ///    has room. The v0.3-α/β/γ fast path during warmup.
+    /// 3. **Evict + retry** — pop an LRU host slot, return its offset
+    ///    to its size pool, retry from step 1. Loops until the
+    ///    allocation lands or `host_lru` is exhausted.
+    ///
+    /// **Returns `Ok(false)` only when:**
+    /// - `host_budget_bytes == 0` (tier disabled).
+    /// - `range.len > host_budget_bytes` (single weight too big — no
+    ///   allocator strategy fixes this; raise the budget).
+    /// - High water saturated AND no resident slot has size `range.len`,
+    ///   so eviction can never produce a usable pool slot. Cross-size
+    ///   pathological case; benign for MoE (uniform sizes), can occur
+    ///   in heavily mixed dense+MoE workloads. Caller falls back to
+    ///   the v0.2 disk path for that one weight rather than crashing.
     fn try_cold_load_into_host(
         &mut self,
         id: WeightId,
@@ -916,12 +950,70 @@ impl WeightPager {
         if self.config.host_budget_bytes == 0 {
             return Ok(false);
         }
-        let need = range.len as u64;
-        if self.host_used_bytes.saturating_add(need) > self.config.host_budget_bytes {
-            return Ok(false); // arena full — caller falls back to v0.2 path
-        }
+        // ensure_host_arena clamps the budget to MemAvailable, so do it
+        // up front and read the *clamped* cap below — otherwise the
+        // allocator could carve past what was actually mapped.
         self.ensure_host_arena(gpu)?;
-        let offset = self.host_used_bytes as usize;
+        let arena_cap = self.config.host_budget_bytes as usize;
+        if range.len > arena_cap {
+            // Single weight bigger than the entire (clamped) arena. No
+            // amount of eviction creates room. Caller falls back to disk.
+            if self.config.trace {
+                eprintln!(
+                    "[weight_pager] host-load skip {id:?}: weight {} bytes > arena cap {} bytes",
+                    range.len, arena_cap,
+                );
+            }
+            return Ok(false);
+        }
+
+        // One-shot stream sync (lazy, only if we end up evicting). An
+        // in-flight memcpy_htod_async could be reading a slot we're
+        // about to recycle; sync the transfer stream once before any
+        // eviction fires so the recycled offset is safe to overwrite.
+        let mut transfer_synced = false;
+        let offset = loop {
+            // (1) Pool hit — same-size slot left over from an eviction.
+            if let Some(off) = self
+                .host_pools
+                .get_mut(&range.len)
+                .and_then(|v| v.pop())
+            {
+                break off;
+            }
+            // (2) Tail carve — first-time slot creation.
+            if self.host_high_water + range.len <= arena_cap {
+                let off = self.host_high_water;
+                self.host_high_water += range.len;
+                break off;
+            }
+            // (3) Evict one and retry. Sync once before the first
+            // eviction; subsequent iterations see `transfer_synced=true`
+            // and skip the redundant wait.
+            if !transfer_synced {
+                if let Some(stream) = self.transfer_stream.as_ref() {
+                    gpu.hip.stream_synchronize(stream)?;
+                }
+                transfer_synced = true;
+            }
+            if !self.evict_one_host_lru() {
+                // LRU empty: arena is fully carved, no pool slot of
+                // this size, and nothing left to evict. Cross-size
+                // saturation (e.g. arena full of size-A slots, asking
+                // for size-B that has zero residents). Caller falls
+                // back to v0.2 disk path for this weight.
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] host-load skip {id:?}: arena saturated with no \
+                         size-{} slots and LRU exhausted",
+                        range.len,
+                    );
+                }
+                return Ok(false);
+            }
+        };
+
+        let need = range.len as u64;
         {
             let arena = self.host_arena.as_mut().unwrap();
             self.transport.read_to_host(
@@ -935,14 +1027,53 @@ impl WeightPager {
         self.host_lru.push_back(id);
         if self.config.trace {
             eprintln!(
-                "[weight_pager] host-load {id:?} ({} bytes) @ off {} — {}MB used / {} entries",
+                "[weight_pager] host-load {id:?} ({} bytes) @ off {} — \
+                 used {}MB / hi-water {}MB / {} entries",
                 range.len,
                 offset,
                 self.host_used_bytes / (1024 * 1024),
+                self.host_high_water / (1024 * 1024),
                 self.host_resident.len()
             );
         }
         Ok(true)
+    }
+
+    /// Pop the LRU front, free its slot back to the size pool, and
+    /// update bookkeeping. Returns `false` if the LRU was empty (caller
+    /// has nothing more to evict). Does **not** sync the transfer
+    /// stream — caller is responsible for that one-shot wait before
+    /// the first eviction in a sequence (see [`Self::try_cold_load_into_host`]
+    /// and [`Self::evict_host_lru_until`]).
+    fn evict_one_host_lru(&mut self) -> bool {
+        let id = match self.host_lru.pop_front() {
+            Some(id) => id,
+            None => return false,
+        };
+        let h = self
+            .host_resident
+            .remove(&id)
+            .expect("host_lru/host_resident invariant: lru has id but residency map does not");
+        self.host_pools
+            .entry(h.bytes as usize)
+            .or_default()
+            .push(h.offset);
+        self.host_used_bytes = self.host_used_bytes.saturating_sub(h.bytes);
+        if self.config.trace {
+            let pool_free = self
+                .host_pools
+                .get(&(h.bytes as usize))
+                .map(|v| v.len())
+                .unwrap_or(0);
+            eprintln!(
+                "[weight_pager] host-evict {id:?} ({} bytes) → pool[{}]={} free, used={}MB",
+                h.bytes,
+                h.bytes,
+                pool_free,
+                self.host_used_bytes / (1024 * 1024),
+            );
+        }
+        true
     }
 
     /// Pre-populate the host tier with as many registered weights as
@@ -951,11 +1082,13 @@ impl WeightPager {
     /// PCIe-bound (in-RAM) rather than NVMe-bound (on-disk) — for the
     /// portion that fits.
     ///
-    /// **Opportunistic**: if the budget is smaller than the catalog
-    /// total, the first N weights get cached and the rest fall through
-    /// to the v0.2 disk path on every page-in. Caller can also leave
-    /// warmup off and let the host tier fill lazily during forward
-    /// (same end state on the second pass).
+    /// **Stops at budget**: when the next weight would force eviction,
+    /// the loop exits early. With v0.3-δ slab eviction enabled, naively
+    /// continuing would LRU-thrash the arena — load slot 1, then evict
+    /// it to load slot (cap+1), then evict that to load slot (cap+2),
+    /// etc. The forward path pulls what it actually needs lazily, so
+    /// warmup beyond the budget would just generate wasted NVMe reads
+    /// for weights that immediately get displaced.
     pub fn prefetch_all_to_host(
         &mut self,
         gpu: &mut Gpu,
@@ -963,11 +1096,26 @@ impl WeightPager {
         if self.config.host_budget_bytes == 0 {
             return Ok(());
         }
+        let cap = self.config.host_budget_bytes;
         let ids: Vec<WeightId> = self.catalog.keys().copied().collect();
         for id in ids {
-            // try_cold_load_into_host returns Ok(false) when the arena
-            // is full — keep iterating so trace stays useful; the
-            // remainder simply won't be host-cached.
+            let need = match self.catalog.get(&id) {
+                Some(r) => r.len as u64,
+                None => continue,
+            };
+            if self.host_used_bytes.saturating_add(need) > cap {
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] prefetch_all_to_host: budget reached at {} entries, \
+                         {} MB used / {} MB cap — remaining {} weights will load lazily",
+                        self.host_resident.len(),
+                        self.host_used_bytes / (1024 * 1024),
+                        cap / (1024 * 1024),
+                        self.catalog.len().saturating_sub(self.host_resident.len()),
+                    );
+                }
+                break;
+            }
             self.prefetch_to_host(id, gpu)?;
         }
         Ok(())
@@ -980,22 +1128,49 @@ impl WeightPager {
         }
     }
 
-    /// Host-tier eviction stub. v0.3-α only supports the
-    /// `host_budget_bytes ≥ total paged weights` regime (mode B —
-    /// permanent host residency); the bump-arena layout doesn't
-    /// support partial reclamation. Returns `BudgetExhausted` when
-    /// callers need more room than the arena was sized for. v0.3-β
-    /// will introduce a slab/free-list scheme to enable real eviction.
+    /// Free host-tier slots until `host_used_bytes + need_bytes`
+    /// fits under the configured budget. Pops LRU front entries one
+    /// at a time, returning each freed offset to its size pool so
+    /// subsequent same-size allocations reuse it.
+    ///
+    /// **Note**: this is a logical-occupancy guarantee, not a
+    /// "you can definitely allocate `need_bytes` of size N right now"
+    /// guarantee — same-size pool slots become available immediately,
+    /// but cross-size carves still depend on `host_high_water` having
+    /// room. [`Self::try_cold_load_into_host`] does its own
+    /// allocation-aware eviction loop; this method exists for
+    /// callers that want to proactively free room (e.g. a future
+    /// predictive-prefetch layer).
+    ///
+    /// Returns `BudgetExhausted` when the LRU is exhausted and
+    /// `host_used_bytes + need_bytes` still exceeds the budget.
     pub fn evict_host_lru_until(
         &mut self,
         need_bytes: u64,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
-        Err(WeightPagerError::BudgetExhausted {
-            need_bytes,
-            in_use: self.host_used_bytes,
-            budget: self.config.host_budget_bytes,
-        })
+        if self.config.host_budget_bytes == 0 {
+            return Ok(());
+        }
+        let budget = self.config.host_budget_bytes;
+        if self.host_used_bytes.saturating_add(need_bytes) <= budget {
+            return Ok(());
+        }
+        // One-shot transfer-stream sync before recycling any slot that
+        // an in-flight async H2D might still be reading.
+        if let Some(stream) = self.transfer_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
+        while self.host_used_bytes.saturating_add(need_bytes) > budget {
+            if !self.evict_one_host_lru() {
+                return Err(WeightPagerError::BudgetExhausted {
+                    need_bytes,
+                    in_use: self.host_used_bytes,
+                    budget,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Number of weights currently held in the host tier.
@@ -1247,6 +1422,8 @@ impl WeightPager {
         self.host_resident.clear();
         self.host_lru.clear();
         self.host_used_bytes = 0;
+        self.host_pools.clear();
+        self.host_high_water = 0;
         // Pinned arena needs hipHostFree; pageable just drops.
         match self.host_arena.take() {
             Some(HostArena::Pinned(buf)) => { let _ = gpu.hip.host_free(buf); }
@@ -1490,6 +1667,105 @@ mod tests {
         assert!(!pager.is_resident(id));
         assert!(pager.get(id).is_none());
         // ensure_resident requires a real Gpu — exercised in integration tests.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v0.3-δ slab pool: post-construction state. New pools/high-water
+    /// fields start empty so the first allocation in
+    /// `try_cold_load_into_host` takes the tail-carve path.
+    #[test]
+    fn slab_pools_start_empty() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-slab-init-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        assert!(pager.host_pools.is_empty(), "host_pools should be empty on construction");
+        assert_eq!(pager.host_high_water, 0, "host_high_water should be 0 on construction");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v0.3-δ eviction: popping the LRU returns the offset to the
+    /// matching size pool. This is the core "same-size reuse" property
+    /// that makes MoE workloads (uniform expert sizes) hit the pool fast
+    /// path on every page-in after the first arena fill.
+    #[test]
+    fn evict_one_recycles_offset_into_size_pool() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-slab-evict-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let mut pager =
+            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        // Inject a synthetic resident slot — bypasses ensure_host_arena
+        // (no Gpu available in unit tests). The eviction path only touches
+        // bookkeeping, not the arena bytes.
+        let id = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
+        let bytes: u64 = 4096;
+        pager.host_resident.insert(id, HostResident { offset: 0, bytes });
+        pager.host_lru.push_back(id);
+        pager.host_used_bytes = bytes;
+        pager.host_high_water = bytes as usize;
+
+        assert!(pager.evict_one_host_lru(), "evict_one should pop the LRU front");
+        assert!(!pager.host_resident.contains_key(&id), "residency should be cleared");
+        assert_eq!(pager.host_used_bytes, 0, "used bytes should drop by the slot size");
+        // High water doesn't recede — that's the v0.3-δ design (only
+        // matching-size carves see this; mismatched-size allocs need eviction).
+        assert_eq!(pager.host_high_water, bytes as usize, "high water never recedes");
+        let pool = pager.host_pools.get(&(bytes as usize)).expect("size pool created");
+        assert_eq!(pool, &vec![0usize], "freed offset is in the matching size pool");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v0.3-δ eviction: LRU order is FIFO (front = least-recently-used).
+    /// Two slots inserted in order A, B → eviction pops A first.
+    #[test]
+    fn evict_one_respects_lru_order() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-slab-lru-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let mut pager =
+            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        let a = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
+        let b = WeightId::Expert { layer: 0, expert: 1, role: ExpertRole::GateUp };
+        let bytes: u64 = 2048;
+        pager.host_resident.insert(a, HostResident { offset: 0, bytes });
+        pager.host_lru.push_back(a);
+        pager.host_resident.insert(b, HostResident { offset: bytes as usize, bytes });
+        pager.host_lru.push_back(b);
+        pager.host_used_bytes = bytes * 2;
+        pager.host_high_water = (bytes as usize) * 2;
+
+        assert!(pager.evict_one_host_lru());
+        assert!(!pager.host_resident.contains_key(&a), "A (LRU front) evicted first");
+        assert!(pager.host_resident.contains_key(&b), "B survives");
+
+        assert!(pager.evict_one_host_lru());
+        assert!(!pager.host_resident.contains_key(&b), "B evicted next");
+
+        assert!(!pager.evict_one_host_lru(), "empty LRU returns false");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v0.3-δ free_all: clears the new slab state along with the rest.
+    /// Doesn't actually call free_all (needs a Gpu), but checks the
+    /// fields it would touch start at the expected reset values after
+    /// construction — so any future regression that adds non-zero
+    /// init would surface here.
+    #[test]
+    fn slab_state_reset_invariant() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-slab-reset-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        assert_eq!(pager.host_used_bytes(), 0);
+        assert!(pager.host_pools.is_empty());
+        assert_eq!(pager.host_high_water, 0);
+        assert!(pager.host_lru.is_empty());
+        assert_eq!(pager.host_resident_count(), 0);
         let _ = std::fs::remove_file(&path);
     }
 }
