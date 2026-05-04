@@ -144,6 +144,13 @@ pub enum NormKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferHandle(u64);
 
+/// Index into `WeightPager::transfer_events`. Returned by
+/// `fill_into_async`; consumed by `wait_transfer`. v0.3-β scope —
+/// the slot is single-shot, calling wait twice on the same idx is a
+/// usage bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferEventIdx(usize);
+
 /// Abstraction over how the pager moves bytes from host storage to VRAM.
 ///
 /// **This is the migration seam for the NVMe→VRAM DMA future.** Today's impl
@@ -460,6 +467,17 @@ pub struct WeightPager {
     /// Bytes currently held by `host_resident`. Doubles as the
     /// bump-arena cursor: next allocation lands at `host_arena[host_used_bytes..]`.
     host_used_bytes: u64,
+    /// Dedicated GPU stream for async H2D transfers (v0.3-β). Distinct
+    /// from the compute stream so transfer for layer N+1 can run
+    /// concurrently with compute on layer N. Allocated lazily on first
+    /// `fill_into_async` call so non-async callers don't pay for the
+    /// stream creation.
+    transfer_stream: Option<hip_bridge::Stream>,
+    /// In-flight transfer events. `fill_into_async` records an event
+    /// after each async memcpy and returns its index; `wait_transfer`
+    /// syncs the event by index. Slots are reused — the LRU is just
+    /// the index `Vec`, not a queue.
+    transfer_events: Vec<hip_bridge::Event>,
     /// Per-weight (file_offset, byte_len) for cold-load via Transport.
     /// Populated at registration time when the model loader walks the HFQ
     /// tensor index. Stable across the run.
@@ -536,6 +554,8 @@ impl WeightPager {
             host_arena: None,
             host_lru: VecDeque::new(),
             host_used_bytes: 0,
+            transfer_stream: None,
+            transfer_events: Vec::new(),
             catalog: HashMap::new(),
             transport,
             config,
@@ -799,6 +819,123 @@ impl WeightPager {
         self.host_used_bytes
     }
 
+    /// **Async** fill: enqueue an H2D copy for `id` into `dst` on the
+    /// pager's dedicated transfer stream. Returns an event index that
+    /// the caller passes to [`wait_transfer`] before reading `dst`
+    /// (e.g. before launching a kernel that consumes it).
+    ///
+    /// Source is the host tier (v0.3-α arena). When the weight isn't
+    /// host-resident, this falls back to the synchronous path —
+    /// `transport.read_to_host` is blocking pread, so there's no
+    /// async benefit until the weight is in the arena. v0.3-β-α
+    /// scope: dense paged forward warms host tier opportunistically
+    /// during prefetch_all_to_host, so steady-state is "always async."
+    ///
+    /// Stream + scratch ordering is the caller's responsibility: this
+    /// only guarantees `dst` won't be read by the transfer past
+    /// completion of the returned event.
+    pub fn fill_into_async(
+        &mut self,
+        id: WeightId,
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> Result<TransferEventIdx, WeightPagerError> {
+        let range = *self
+            .catalog
+            .get(&id)
+            .ok_or(WeightPagerError::NotRegistered(id))?;
+        // Cold-load into host arena if missing (opportunistic — sync
+        // pread). If the arena is full, this returns false and we
+        // fall back to the v0.2 sync path so the caller doesn't see
+        // a partial async semantics.
+        let host_hit = self.host_resident.contains_key(&id)
+            || self.try_cold_load_into_host(id, range, gpu)?;
+        if !host_hit {
+            // No host shadow available — sync transport path. The
+            // caller still gets an event back so the consumer wait
+            // pattern is uniform; we record an event on the default
+            // stream after the sync copy.
+            self.transport.fill_into(range.offset, range.len, dst, gpu)?;
+            return self.record_transfer_on_default_stream(gpu);
+        }
+        // Host hit: async memcpy on transfer stream + event record.
+        self.ensure_transfer_stream(gpu)?;
+        let evt = gpu.hip.event_create()?;
+        {
+            let stream = self.transfer_stream.as_ref().unwrap();
+            let h = self.host_resident.get(&id).unwrap();
+            let arena = self.host_arena.as_ref().expect(
+                "host_resident populated without host_arena — pager invariant",
+            );
+            gpu.hip.memcpy_htod_async(
+                &dst.buf,
+                &arena[h.offset..h.offset + h.bytes as usize],
+                stream,
+            )?;
+            gpu.hip.event_record(&evt, Some(stream))?;
+        }
+        self.touch_host_lru(id);
+        let idx = self.transfer_events.len();
+        self.transfer_events.push(evt);
+        Ok(TransferEventIdx(idx))
+    }
+
+    /// Block until the transfer for `idx` completes. Safe to call
+    /// after the corresponding `fill_into_async` returns. The event
+    /// is consumed (destroyed) — calling `wait_transfer` twice with
+    /// the same idx is a usage bug. v0.3-β-α uses one-shot events
+    /// without slot reuse for simplicity; v0.3-β-β can pool them if
+    /// the per-token event-create overhead becomes visible.
+    pub fn wait_transfer(
+        &mut self,
+        idx: TransferEventIdx,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        let evt = std::mem::replace(
+            self.transfer_events
+                .get_mut(idx.0)
+                .ok_or_else(|| WeightPagerError::Hip(hip_bridge::HipError::new(
+                    0,
+                    &format!("wait_transfer: event idx {} out of range", idx.0),
+                )))?,
+            // Replace with a sentinel; we destroy the real event below.
+            // event_create on a fresh event is cheap enough at ~μs that
+            // a sentinel is acceptable. Alternative: Vec<Option<Event>>.
+            gpu.hip.event_create()?,
+        );
+        gpu.hip.event_synchronize(&evt)?;
+        let _ = gpu.hip.event_destroy(evt);
+        Ok(())
+    }
+
+    fn ensure_transfer_stream(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        if self.transfer_stream.is_none() {
+            self.transfer_stream = Some(gpu.hip.stream_create()?);
+        }
+        Ok(())
+    }
+
+    /// Record an event after a synchronous transfer so the caller can
+    /// uniformly wait. Used when async fill fell back to sync path
+    /// (e.g. host arena was full). The event records on the default
+    /// stream so it fires after the prior synchronous copy completes.
+    fn record_transfer_on_default_stream(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<TransferEventIdx, WeightPagerError> {
+        let evt = gpu.hip.event_create()?;
+        // Record on default stream (None) so the event fires once any
+        // already-issued default-stream work — including the sync copy
+        // we just did — completes.
+        gpu.hip.event_record(&evt, None)?;
+        let idx = self.transfer_events.len();
+        self.transfer_events.push(evt);
+        Ok(TransferEventIdx(idx))
+    }
+
     /// Patch the device-side `expert_*_ptrs` indirection table so the indexed
     /// MoE GEMV kernels read the currently-resident buffer pointers for the
     /// active experts in `top_indices` for `layer`.
@@ -921,6 +1058,16 @@ impl WeightPager {
         self.host_used_bytes = 0;
         // Vec<u8> arena drops naturally via take().
         let _ = self.host_arena.take();
+        // Tear down the transfer stream + drain any lingering events.
+        // Sync first (waits for any in-flight copy) so destroying the
+        // event objects doesn't yank state out from under the GPU.
+        for evt in self.transfer_events.drain(..) {
+            let _ = gpu.hip.event_destroy(evt);
+        }
+        if let Some(stream) = self.transfer_stream.take() {
+            let _ = gpu.hip.stream_synchronize(&stream);
+            let _ = gpu.hip.stream_destroy(stream);
+        }
     }
 
     /// Get the resident tensor for `id`. Returns `None` if not resident
