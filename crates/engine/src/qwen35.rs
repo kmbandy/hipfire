@@ -1074,6 +1074,15 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 .unwrap_or_else(|_| "pread".to_string());
             let pager = match transport_choice.as_str() {
                 #[cfg(target_os = "linux")]
+                "p2p" => {
+                    eprintln!("[weight_pager] transport: io_uring + dma_buf P2P (v0.5 NVMe→VRAM direct)");
+                    crate::weight_pager::WeightPager::with_iouring_p2p_transport(
+                        hfq.path(), pager_cfg,
+                    ).map_err(|e| hip_bridge::HipError::new(0, &format!(
+                        "failed to open HFQ file for io_uring P2P transport: {}", e
+                    )))?
+                }
+                #[cfg(target_os = "linux")]
                 "iouring" => {
                     eprintln!("[weight_pager] transport: io_uring (v0.4 batched parallel reads)");
                     crate::weight_pager::WeightPager::with_iouring_transport(
@@ -1092,7 +1101,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 }
                 other => {
                     return Err(hip_bridge::HipError::new(0, &format!(
-                        "unknown HIPFIRE_TRANSPORT='{other}' — expected 'pread' or 'iouring'"
+                        "unknown HIPFIRE_TRANSPORT='{other}' — expected 'pread', 'iouring', or 'p2p'"
                     )));
                 }
             };
@@ -1551,6 +1560,36 @@ fn pager_dense_async_prefetch_layer(
     };
     use crate::weight_pager::{ByteRange, FfnRole, WeightId};
     let mut pager = pager_rc.borrow_mut();
+
+    // v0.5: when the transport supports direct NVMe → VRAM reads
+    // (dma_buf + io_uring P2P), skip the host arena entirely and pull
+    // the layer's 3 weights straight into the dense scratch tensors.
+    // Returns no async events — the io_uring read completes inside
+    // the call. (A future v0.5-β can split submit from wait for
+    // compute/transfer overlap; for v0.5-α we keep it simple and
+    // measure pure I/O wins first.)
+    if pager.supports_direct_to_vram() {
+        let direct_batch = [
+            (
+                WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Gate },
+                &scratch.gate[slot],
+            ),
+            (
+                WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Up },
+                &scratch.up[slot],
+            ),
+            (
+                WeightId::DenseFfn { layer: layer_idx, role: FfnRole::Down },
+                &scratch.down[slot],
+            ),
+        ];
+        pager.read_batch_direct_to_vram(&direct_batch, gpu).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!(
+                "paged P2P direct-to-VRAM L{layer_idx}/s{slot}: {e}"
+            ))
+        })?;
+        return Ok(Vec::new());
+    }
 
     // v0.4: batch the host-tier population for this layer's 3 weights
     // so the underlying transport can issue all 3 file reads in
@@ -5587,7 +5626,15 @@ fn forward_scratch_layers(
     let pager_pinned = weights.pager.as_ref()
         .map(|p| p.borrow().host_arena_pinned())
         .unwrap_or(false);
-    let async_overlap = dense_paged && pager_pinned;
+    // v0.5: P2P transport doesn't use the host arena at all (no
+    // mlock'd buffer to be "pinned"), but it still uses the prefetch
+    // flow — pager_dense_async_prefetch_layer reads directly into
+    // VRAM scratch via dma_buf instead of going through host staging.
+    // Engage the prefetch loop in either pinned-host OR P2P mode.
+    let pager_p2p = weights.pager.as_ref()
+        .map(|p| p.borrow().supports_direct_to_vram())
+        .unwrap_or(false);
+    let async_overlap = dense_paged && (pager_pinned || pager_p2p);
     let mut pending_prefetch: Option<Vec<crate::weight_pager::TransferEventIdx>> = None;
     let mut compute_evt_for_slot: [Option<hip_bridge::Event>; 2] = [None, None];
     if async_overlap && config.n_layers > 0 {

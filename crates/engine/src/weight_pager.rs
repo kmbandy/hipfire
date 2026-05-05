@@ -241,6 +241,39 @@ pub trait Transport: Send {
         Ok(())
     }
 
+    /// **v0.5 capability query**: does this transport support reading
+    /// directly into VRAM, bypassing the host arena entirely? Returns
+    /// `true` for `IoUringP2PTransport` (NVMe → VRAM via dma_buf).
+    /// Returns `false` for everything else (pread, io_uring, future
+    /// transports that need host staging). The pager dispatches on
+    /// this to choose between the host-arena path and the direct path.
+    fn supports_direct_to_vram(&self) -> bool {
+        false
+    }
+
+    /// **v0.5 batched direct-to-VRAM**: read every (range, dst) pair
+    /// in `batch` straight into the destination GPU tensors, no host
+    /// hop. Default impl errors — only transports that override
+    /// `supports_direct_to_vram` to return `true` should be called
+    /// here. The pager guards on `supports_direct_to_vram` before
+    /// dispatching.
+    ///
+    /// Tuple format: `(file_byte_range, destination_gpu_tensor)`.
+    /// Caller guarantees:
+    /// - `dst.buf.size() >= range.len` for every pair
+    /// - destination buffers do not overlap each other
+    fn read_to_device_par(
+        &mut self,
+        batch: &mut [(ByteRange, &GpuTensor)],
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        let _ = (batch, gpu);
+        Err(hip_bridge::HipError::new(
+            0,
+            "transport does not support read_to_device_par; pager should not have dispatched here",
+        ))
+    }
+
     /// **Predictive readahead hint** (v0.3-ε). Caller is about to need
     /// these byte ranges; transport may pre-warm internal caches or
     /// kick off OS-level readahead so subsequent `read_to_host` /
@@ -729,6 +762,522 @@ impl Transport for IoUringHostTransport {
 }
 
 // ---------------------------------------------------------------------------
+// IoUringP2PTransport (v0.5) — NVMe → VRAM direct via dma_buf
+// ---------------------------------------------------------------------------
+
+/// **v0.5 transport: true NVMe → VRAM zero-copy via dma_buf + io_uring.**
+///
+/// The v0.4 [`IoUringHostTransport`] still routes data through a host
+/// arena: NVMe → host pinned memory → memcpy_htod → VRAM. That's a
+/// PCIe round-trip per cold-load (NVMe→RAM at ~3 GB/s, then RAM→VRAM
+/// at ~25 GB/s). With dma_buf-based P2P the host hop disappears
+/// entirely: NVMe DMAs straight into VRAM via the PCIe peer-to-peer
+/// path on supported hardware.
+///
+/// **How it works**:
+/// 1. The destination GPU tensor's underlying VRAM buffer is exported
+///    as a Linux `dma_buf` fd via `hsa_amd_portable_export_dmabuf`
+///    (AMD HSA API, present in ROCm 5.3+, validated end-to-end on
+///    ROCm 7.2.2 + R9700 via `examples/dmabuf_probe`).
+/// 2. The fd is `mmap`'d into our process address space — yielding a
+///    userspace VA that's backed by VRAM physical pages.
+/// 3. io_uring submits a `IORING_OP_READ` SQE with that VA as
+///    destination. The kernel resolves VA → dma_buf → VRAM physical
+///    pages, sets up DMA, and the NVMe driver writes results
+///    directly into VRAM (P2P) when the PCIe topology allows it. On
+///    topologies that block direct P2P (e.g. devices behind a TB3
+///    controller with ACS upstream-forward enabled), the kernel
+///    transparently bounces through host RAM at the kernel level —
+///    same userspace code, fewer copies than v0.4 either way.
+/// 4. After the read completes, we `munmap` the userspace mapping and
+///    `hsa_amd_portable_close_dmabuf` the fd. The VRAM allocation
+///    itself is untouched and remains owned by HIP.
+///
+/// **Linux 5.6+** (io_uring + mmap'd dma_buf path). Defers gracefully
+/// to v0.4 host-staged reads on Windows/Mac (transport falls back).
+///
+/// **Per-call overhead**: export+mmap+munmap+close is roughly
+/// 4 syscalls per cold-load. Negligible vs the I/O cost (47 MB at
+/// drive bandwidth = ~10-15 ms; 4 syscalls add ~10 µs). For workloads
+/// that re-use the same VRAM buffers across many reads (e.g. dense
+/// scratch ping-pong), a future optimization would cache the
+/// dma_buf+mmap and pass the VA directly without re-exporting; for
+/// v0.5-α we keep it simple.
+#[cfg(target_os = "linux")]
+pub struct IoUringP2PTransport {
+    file: File,
+    path: std::path::PathBuf,
+    ring: io_uring::IoUring,
+    /// Reusable host staging buffer for the host-tier compat methods
+    /// (`fetch`, `fill_into`, `read_to_host`) that callers might still
+    /// use. The whole point of P2P is to bypass these, but we keep
+    /// them functional so this transport is a drop-in for the others.
+    staging: Vec<u8>,
+    next_handle: u64,
+    /// dlopen handle for libhsa-runtime64.so.1. Kept alive for the
+    /// transport's lifetime so the cached function pointers stay
+    /// valid. Closed via `libc::dlclose` in `Drop`.
+    libhsa: *mut libc::c_void,
+    /// `hsa_amd_portable_export_dmabuf` cached at open time.
+    hsa_export_fn: HsaExportDmaBufFn,
+    /// `hsa_amd_portable_close_dmabuf` cached at open time.
+    hsa_close_fn: HsaCloseDmaBufFn,
+}
+
+#[cfg(target_os = "linux")]
+type HsaExportDmaBufFn = unsafe extern "C" fn(
+    *const libc::c_void,
+    usize,
+    *mut i32,
+    *mut u64,
+) -> u32;
+
+#[cfg(target_os = "linux")]
+type HsaCloseDmaBufFn = unsafe extern "C" fn(i32) -> u32;
+
+// libhsa is dlopen'd once at construction, function pointers are stable
+// for the process lifetime. Safe to send the transport across threads.
+#[cfg(target_os = "linux")]
+unsafe impl Send for IoUringP2PTransport {}
+
+#[cfg(target_os = "linux")]
+impl IoUringP2PTransport {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_with_depth(path, 32)
+    }
+
+    pub fn open_with_depth(path: &Path, queue_depth: u32) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+            }
+        }
+        let ring = io_uring::IoUring::new(queue_depth)?;
+
+        // dlopen libhsa-runtime64 and resolve the dma_buf export/close
+        // functions. Returns NotFound if the library or the symbols
+        // aren't there — caller should fall back to a non-P2P transport
+        // on that error.
+        let lib_name = std::ffi::CString::new("libhsa-runtime64.so.1").unwrap();
+        let libhsa = unsafe { libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        if libhsa.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "dlopen libhsa-runtime64.so.1 failed (is ROCm installed?)",
+            ));
+        }
+
+        let export_sym = std::ffi::CString::new("hsa_amd_portable_export_dmabuf").unwrap();
+        let export_ptr = unsafe { libc::dlsym(libhsa, export_sym.as_ptr()) };
+        if export_ptr.is_null() {
+            unsafe { libc::dlclose(libhsa); }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "dlsym hsa_amd_portable_export_dmabuf failed (ROCm too old? Need 5.3+)",
+            ));
+        }
+        let hsa_export_fn: HsaExportDmaBufFn = unsafe { std::mem::transmute(export_ptr) };
+
+        let close_sym = std::ffi::CString::new("hsa_amd_portable_close_dmabuf").unwrap();
+        let close_ptr = unsafe { libc::dlsym(libhsa, close_sym.as_ptr()) };
+        if close_ptr.is_null() {
+            unsafe { libc::dlclose(libhsa); }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "dlsym hsa_amd_portable_close_dmabuf failed",
+            ));
+        }
+        let hsa_close_fn: HsaCloseDmaBufFn = unsafe { std::mem::transmute(close_ptr) };
+
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            ring,
+            staging: Vec::new(),
+            next_handle: 0,
+            libhsa,
+            hsa_export_fn,
+            hsa_close_fn,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn next_handle(&mut self) -> TransferHandle {
+        let h = TransferHandle(self.next_handle);
+        self.next_handle += 1;
+        h
+    }
+
+    /// Submit one io_uring read to a raw destination pointer + wait.
+    /// Used by both the host-tier compat path (staging buffer) and
+    /// the P2P path (mmap'd VRAM via dma_buf).
+    fn iouring_read_one(
+        &mut self,
+        dst_ptr: *mut u8,
+        len: usize,
+        file_offset: usize,
+    ) -> HipResult<()> {
+        use io_uring::{opcode, types};
+        use std::os::unix::io::AsRawFd;
+
+        let read_op = opcode::Read::new(
+            types::Fd(self.file.as_raw_fd()),
+            dst_ptr,
+            len as u32,
+        )
+        .offset(file_offset as u64)
+        .build()
+        .user_data(0);
+
+        unsafe {
+            self.ring.submission().push(&read_op).map_err(|_| {
+                hip_bridge::HipError::new(0, "p2p io_uring SQ full (single read)")
+            })?;
+        }
+        self.ring.submit_and_wait(1).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("p2p io_uring submit_and_wait: {e}"))
+        })?;
+
+        let cqe = self.ring.completion().next().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "p2p io_uring CQE missing")
+        })?;
+        let result = cqe.result();
+        if result < 0 || result as usize != len {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "p2p io_uring read returned {result} (expected {len} at offset {file_offset})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// **The P2P core**: export `vram_ptr` as dma_buf, mmap it, read
+    /// `len` bytes from `file_offset` into the mapping, then unmap and
+    /// close. The mmap'd VA is the read destination passed to
+    /// io_uring; the kernel handles the dma_buf → VRAM resolution.
+    fn dmabuf_direct_read(
+        &mut self,
+        vram_ptr: *mut libc::c_void,
+        len: usize,
+        file_offset: usize,
+    ) -> HipResult<()> {
+        // 1. Export VRAM as dma_buf fd.
+        let mut dmabuf_fd: i32 = -1;
+        let mut dmabuf_offset: u64 = 0;
+        let status = unsafe {
+            (self.hsa_export_fn)(
+                vram_ptr as *const libc::c_void,
+                len,
+                &mut dmabuf_fd as *mut i32,
+                &mut dmabuf_offset as *mut u64,
+            )
+        };
+        if status != 0 || dmabuf_fd < 0 {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "hsa_amd_portable_export_dmabuf failed: status=0x{status:04x} fd={dmabuf_fd}"
+            )));
+        }
+
+        // 2. mmap the dma_buf to get a userspace VA backed by VRAM.
+        //    PROT_WRITE because io_uring writes our read data into it;
+        //    MAP_SHARED so kernel sees writes go through to VRAM.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dmabuf_fd,
+                dmabuf_offset as i64,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error();
+            unsafe { (self.hsa_close_fn)(dmabuf_fd); }
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "mmap dmabuf fd {dmabuf_fd}: {errno}"
+            )));
+        }
+
+        // 3. io_uring read into the mapped VA. The kernel resolves the
+        //    VA → dma_buf → VRAM physical pages and sets up direct DMA
+        //    (or transparently bounces if the topology doesn't allow
+        //    P2P). Either way, no userspace copy.
+        let read_result = self.iouring_read_one(mapped as *mut u8, len, file_offset);
+
+        // 4. Cleanup, regardless of read outcome.
+        let munmap_rc = unsafe { libc::munmap(mapped, len) };
+        let close_status = unsafe { (self.hsa_close_fn)(dmabuf_fd) };
+
+        // Surface the read error first; cleanup errors are secondary.
+        read_result?;
+        if munmap_rc != 0 {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "munmap dmabuf VA failed: {}", std::io::Error::last_os_error()
+            )));
+        }
+        if close_status != 0 {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "hsa_amd_portable_close_dmabuf returned 0x{close_status:04x}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IoUringP2PTransport {
+    fn drop(&mut self) {
+        if !self.libhsa.is_null() {
+            unsafe { libc::dlclose(self.libhsa); }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Transport for IoUringP2PTransport {
+    fn fetch(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<(GpuTensor, TransferHandle)> {
+        // For one-shot fetch: allocate VRAM, then go direct via dma_buf.
+        // Same end state as PreadH2D + memcpy_htod, just no host hop.
+        let buf = gpu.hip.malloc(len)?;
+        let vram_ptr = buf.as_ptr();
+        self.dmabuf_direct_read(vram_ptr, len, hfq_offset)?;
+        let tensor = GpuTensor {
+            buf,
+            shape: vec![len],
+            dtype: rdna_compute::DType::Raw,
+        };
+        Ok((tensor, self.next_handle()))
+    }
+
+    fn fill_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        _gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        // Direct read into the caller's existing VRAM buffer. This is
+        // the dense-paging fast path (gate/up/down scratch ping-pong).
+        let vram_ptr = dst.buf.as_ptr();
+        self.dmabuf_direct_read(vram_ptr, len, hfq_offset)
+    }
+
+    fn read_to_host(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> HipResult<()> {
+        // Compat path: regular io_uring read into host buffer. The
+        // P2P transport doesn't avoid host buffers — it avoids the
+        // *bounce* through one. When the caller explicitly wants
+        // bytes in host memory (e.g. the v0.3 host tier warmup),
+        // we just do a normal io_uring read.
+        debug_assert_eq!(dst.len(), len);
+        self.iouring_read_one(dst.as_mut_ptr(), len, hfq_offset)
+    }
+
+    fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
+        Ok(())
+    }
+
+    fn requires_dma_buf_alloc(&self) -> bool {
+        true
+    }
+
+    fn supports_direct_to_vram(&self) -> bool {
+        true
+    }
+
+    /// **The v0.5 batched win**: export N VRAM destinations as
+    /// dma_bufs, mmap each, submit all N io_uring reads in one syscall,
+    /// drain N completions in one syscall, then unmap+close. Per-layer
+    /// dense overhead: 3 export+mmap, 1 submit_and_wait(3), 3
+    /// munmap+close — total ~12 syscalls vs ~30+ on the v0.4
+    /// host-staged path.
+    fn read_to_device_par(
+        &mut self,
+        batch: &mut [(ByteRange, &GpuTensor)],
+        _gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        use io_uring::{opcode, types};
+        use std::os::unix::io::AsRawFd;
+        let n = batch.len();
+
+        // Phase 1: export + mmap each dst's VRAM region. Track per-slot
+        // (dmabuf_fd, mapped_va, len) for cleanup; on any failure we
+        // unwind everything allocated so far.
+        struct SlotMapping {
+            dmabuf_fd: i32,
+            mapped: *mut libc::c_void,
+            len: usize,
+        }
+        let mut mappings: Vec<SlotMapping> = Vec::with_capacity(n);
+
+        let cleanup = |mappings: &[SlotMapping], close_fn: HsaCloseDmaBufFn| {
+            for m in mappings {
+                if !m.mapped.is_null() && m.mapped != libc::MAP_FAILED {
+                    unsafe { libc::munmap(m.mapped, m.len); }
+                }
+                if m.dmabuf_fd >= 0 {
+                    unsafe { close_fn(m.dmabuf_fd); }
+                }
+            }
+        };
+
+        for (i, (range, dst)) in batch.iter().enumerate() {
+            let vram_ptr = dst.buf.as_ptr();
+            let mut dmabuf_fd: i32 = -1;
+            let mut dmabuf_offset: u64 = 0;
+            let status = unsafe {
+                (self.hsa_export_fn)(
+                    vram_ptr as *const libc::c_void,
+                    range.len,
+                    &mut dmabuf_fd as *mut i32,
+                    &mut dmabuf_offset as *mut u64,
+                )
+            };
+            if status != 0 || dmabuf_fd < 0 {
+                cleanup(&mappings, self.hsa_close_fn);
+                return Err(hip_bridge::HipError::new(0, &format!(
+                    "p2p batch[{i}/{n}] export failed: status=0x{status:04x} fd={dmabuf_fd}"
+                )));
+            }
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    range.len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    dmabuf_fd,
+                    dmabuf_offset as i64,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                let errno = std::io::Error::last_os_error();
+                unsafe { (self.hsa_close_fn)(dmabuf_fd); }
+                cleanup(&mappings, self.hsa_close_fn);
+                return Err(hip_bridge::HipError::new(0, &format!(
+                    "p2p batch[{i}/{n}] mmap failed: {errno}"
+                )));
+            }
+            mappings.push(SlotMapping { dmabuf_fd, mapped, len: range.len });
+        }
+
+        // Phase 2: push all SQEs.
+        let fd = self.file.as_raw_fd();
+        {
+            let mut sq = self.ring.submission();
+            for (i, (m, (range, _))) in mappings.iter().zip(batch.iter()).enumerate() {
+                let read_op = opcode::Read::new(
+                    types::Fd(fd),
+                    m.mapped as *mut u8,
+                    range.len as u32,
+                )
+                .offset(range.offset as u64)
+                .build()
+                .user_data(i as u64);
+                unsafe {
+                    if sq.push(&read_op).is_err() {
+                        drop(sq);
+                        cleanup(&mappings, self.hsa_close_fn);
+                        return Err(hip_bridge::HipError::new(0, &format!(
+                            "p2p io_uring SQ full at batch idx {i}/{n}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Phase 3: submit + wait for all completions.
+        if let Err(e) = self.ring.submit_and_wait(n) {
+            cleanup(&mappings, self.hsa_close_fn);
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "p2p batch submit_and_wait: {e}"
+            )));
+        }
+
+        // Phase 4: drain N CQEs, validate each. Snapshot per-slot
+        // (offset, len) before borrowing the completion queue.
+        let expected_per_idx: Vec<(usize, usize)> = batch.iter()
+            .map(|(r, _)| (r.offset, r.len))
+            .collect();
+        let mut cq = self.ring.completion();
+        let mut drain_err: Option<hip_bridge::HipError> = None;
+        for _ in 0..n {
+            let cqe = match cq.next() {
+                Some(c) => c,
+                None => {
+                    drain_err = Some(hip_bridge::HipError::new(0, "p2p batch CQE missing"));
+                    break;
+                }
+            };
+            let idx = cqe.user_data() as usize;
+            if idx >= n {
+                drain_err = Some(hip_bridge::HipError::new(0, &format!(
+                    "p2p batch CQE bogus user_data {idx}"
+                )));
+                break;
+            }
+            let (file_off, expected) = expected_per_idx[idx];
+            let result = cqe.result();
+            if result < 0 || result as usize != expected {
+                drain_err = Some(hip_bridge::HipError::new(0, &format!(
+                    "p2p batch read [{idx}] returned {result} (expected {expected} at offset {file_off})"
+                )));
+                break;
+            }
+        }
+        drop(cq);
+
+        // Phase 5: cleanup all mappings, regardless of drain outcome.
+        cleanup(&mappings, self.hsa_close_fn);
+
+        if let Some(e) = drain_err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn advise_prefetch(&self, ranges: &[ByteRange]) {
+        // Same as IoUringHostTransport — POSIX_FADV_WILLNEED. Helps
+        // when the read happens to land in a path that benefits from
+        // page cache priming (typically the host-tier compat methods,
+        // not the P2P path).
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            for r in ranges {
+                unsafe {
+                    libc::posix_fadvise(
+                        fd,
+                        r.offset as libc::off_t,
+                        r.len as libc::off_t,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+        }
+        let _ = ranges;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -976,6 +1525,54 @@ impl WeightPager {
     pub fn with_iouring_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
         let transport = IoUringHostTransport::open(hfq_path)?;
         Ok(Self::new(Box::new(transport), config))
+    }
+
+    /// **v0.5 convenience**: open `hfq_path` with the io_uring + dma_buf
+    /// P2P transport. Linux-only, AMD ROCm 5.3+, requires
+    /// `CONFIG_PCI_P2PDMA=y` and PCIe ACS settings allowing peer DMA
+    /// between the NVMe and the GPU. Falls back to kernel-level bounce
+    /// when direct P2P isn't available, but the userspace path is the
+    /// same in both cases (no host arena needed).
+    #[cfg(target_os = "linux")]
+    pub fn with_iouring_p2p_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
+        let transport = IoUringP2PTransport::open(hfq_path)?;
+        Ok(Self::new(Box::new(transport), config))
+    }
+
+    /// **v0.5 capability query**: does the underlying transport support
+    /// direct NVMe → VRAM reads (no host hop)? When `true`, callers
+    /// can use [`Self::read_batch_direct_to_vram`] and skip the host
+    /// arena entirely.
+    pub fn supports_direct_to_vram(&self) -> bool {
+        self.transport.supports_direct_to_vram()
+    }
+
+    /// **v0.5 batched direct-to-VRAM read**: for each (id, dst) pair,
+    /// look up the file byte range via the catalog and issue a
+    /// parallel batched read straight into the destination VRAM
+    /// buffer. Bypasses the host arena entirely — no `host_resident`
+    /// updates, no eviction, no mlock concerns.
+    ///
+    /// Caller must ensure the destination tensors are at least
+    /// `range.len` bytes each. Errors if any id is unregistered.
+    pub fn read_batch_direct_to_vram(
+        &mut self,
+        batch: &[(WeightId, &GpuTensor)],
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut io_batch: Vec<(ByteRange, &GpuTensor)> = Vec::with_capacity(batch.len());
+        for &(id, tensor) in batch {
+            let range = self.catalog.get(&id).copied().ok_or_else(|| {
+                hip_bridge::HipError::new(0, &format!(
+                    "read_batch_direct_to_vram: weight {id:?} not registered"
+                ))
+            })?;
+            io_batch.push((range, tensor));
+        }
+        self.transport.read_to_device_par(&mut io_batch, gpu)
     }
 
     /// Register that `id` lives at `range` in the HFQ file. Called by the
