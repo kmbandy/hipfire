@@ -4,12 +4,16 @@ members = [
     "crates/hip-bridge",
     "crates/hsa-bridge",
     "crates/rdna-compute",
-    "crates/engine",
+    "crates/hipfire-runtime",
+    "crates/hipfire-arch-qwen35",
+    "crates/hipfire-arch-qwen35-vl",
+    "crates/hipfire-arch-llama",
+    "crates/hipfire-arch-toy",
     "crates/hipfire-quantize",
     "crates/redline",
 ]
 
 [workspace.package]
-version = "0.1.9-alpha.1"
+version = "0.1.20"
 edition = "2021"
 license = "MIT"

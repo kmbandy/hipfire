@@ -90,3 +90,5 @@ research/
 .codeinsight+research/
 .gitnexus
 .mneme-code
+
+bench/coherence-results/
