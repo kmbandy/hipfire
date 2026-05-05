@@ -2298,6 +2298,29 @@ fn qwen35_paged_moe_dispatch(
     {
         let mut pager = pager_rc.borrow_mut();
         if pager.host_arena_pinned() {
+            // v0.4: batch the 16-weight cold-load (8 experts × 2 roles)
+            // into one parallel io_uring submission. The ensure_resident_async
+            // loop below then hits the host-resident fast path for every
+            // weight that was newly batched in, skipping the per-call
+            // cold-load entirely. For pread transport the batch falls
+            // back to sequential reads with the same end state — the
+            // batching doesn't hurt, the parallel transport is what
+            // pays off.
+            let batch_input: Vec<(WeightId, crate::weight_pager::ByteRange)> = topk_indices
+                .iter()
+                .flat_map(|&idx| {
+                    let g = WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::GateUp };
+                    let d = WeightId::Expert { layer, expert: idx as u16, role: ExpertRole::Down };
+                    [g, d].into_iter()
+                })
+                .filter_map(|id| pager.byte_range_of(id).map(|r| (id, r)))
+                .collect();
+            pager.try_cold_load_batch_into_host(&batch_input, gpu).map_err(|e| {
+                hip_bridge::HipError::new(0, &format!(
+                    "paged batch cold-load MoE @ layer {layer}: {e}"
+                ))
+            })?;
+
             let mut events = Vec::with_capacity(topk_indices.len() * 2);
             for &idx in topk_indices {
                 if let Some(e) = pager.ensure_resident_async(
