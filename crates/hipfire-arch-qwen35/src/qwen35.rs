@@ -1514,6 +1514,7 @@ pub fn load_weights_multi(
     Ok(Qwen35Weights {
         token_embd, embd_format: embd_fmt, output_norm, output, layers,
         pager: None,
+        dense_scratch: None,
     })
 }
 
@@ -1678,7 +1679,7 @@ fn load_layer_into(
                 norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
                 wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                 ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16)?,
+                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16, None)?,
             })
         }
         (LayerType::FullAttention, true) => {
@@ -1693,7 +1694,7 @@ fn load_layer_into(
                 q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                 k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                 ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16)?,
+                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16, None)?,
             })
         }
     })
