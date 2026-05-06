@@ -34,7 +34,7 @@
 //! follow-up commits — the trait shapes here are the seams those commits plug
 //! into without changing the forward path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::path::Path;
 
@@ -1329,11 +1329,33 @@ pub struct WeightPager {
     /// What's currently in VRAM. Maps weight identity to a `Resident` record
     /// holding the buffer + bookkeeping for LRU.
     resident: HashMap<WeightId, Resident>,
-    /// Recency queue for LRU eviction. Most-recently-used at the back.
-    /// We use VecDeque because mutations are O(n) but n is tiny (top-k
-    /// experts × layers, max ~thousands), and VecDeque iteration is
-    /// cache-friendly.
-    lru: VecDeque<WeightId>,
+    /// LRU recency tracking, implemented as a paired `id ↔ generation`
+    /// index so all ops are O(log n).
+    ///
+    /// **v0.2 policy choice.** Flat LRU across all `WeightId`s. Per PR #167's
+    /// Phase 0 measurements, A3B routing entropy is 7.0–7.26 bits out of 8
+    /// — so a 32-expert resident cache covers only 42–48 % of routing
+    /// decisions, and any fixed-set policy (LRU, MRU, LFU) approaches
+    /// random replacement in that regime. Per-layer segmentation is **not**
+    /// applied here because the pager has no notion of "current layer" —
+    /// it's a passive cache, scheduled by the caller; segmentation requires
+    /// a layer-rotation hint that doesn't exist in the v0.2 API. The
+    /// headline win in v0.2 comes from io_uring batching the cold-load
+    /// path (9.1× prefill on 27B dense), which makes eviction-policy
+    /// quality structurally less load-bearing than transport bandwidth.
+    /// v0.3 will revisit policy with empirical hit-rate data from
+    /// production workloads.
+    ///
+    /// **Data structure.** A monotonic `lru_gen_counter` mints a fresh
+    /// generation on every touch. `lru_id_to_gen` maps id → its current
+    /// generation; `lru_gen_to_id` is the reverse, kept sorted by gen so
+    /// `pop_first` returns the LRU victim in O(log n). Replaces the v0.1
+    /// `VecDeque<WeightId>` whose `touch_lru` was O(n) — for A3B at full
+    /// residency (~14k entries) the 448 touches per forward-pass dropped
+    /// from ~6M ops to ~6k ops on the critical path.
+    lru_id_to_gen: HashMap<WeightId, u64>,
+    lru_gen_to_id: BTreeMap<u64, WeightId>,
+    lru_gen_counter: u64,
     /// Bytes currently held by `resident`.
     vram_used_bytes: u64,
     /// **Host (pinned-RAM) tier** (v0.3). Independent of `resident` — a
@@ -1493,7 +1515,9 @@ impl WeightPager {
     pub fn new(transport: Box<dyn Transport>, config: PagerConfig) -> Self {
         Self {
             resident: HashMap::new(),
-            lru: VecDeque::new(),
+            lru_id_to_gen: HashMap::new(),
+            lru_gen_to_id: BTreeMap::new(),
+            lru_gen_counter: 0,
             vram_used_bytes: 0,
             host_resident: HashMap::new(),
             host_arena: None,
@@ -1668,7 +1692,7 @@ impl WeightPager {
         };
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         self.resident.insert(id, Resident { tensor, bytes: need });
-        self.lru.push_back(id);
+        self.lru_touch(id);
         Ok(())
     }
 
@@ -1734,7 +1758,7 @@ impl WeightPager {
             };
             self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
             self.resident.insert(id, Resident { tensor, bytes: need });
-            self.lru.push_back(id);
+            self.lru_touch(id);
             let idx = self.transfer_events.len();
             self.transfer_events.push(evt);
             return Ok(Some(TransferEventIdx(idx)));
@@ -1745,7 +1769,7 @@ impl WeightPager {
         let (tensor, _h) = self.transport.fetch(range.offset, range.len, gpu)?;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         self.resident.insert(id, Resident { tensor, bytes: need });
-        self.lru.push_back(id);
+        self.lru_touch(id);
         if self.config.trace {
             eprintln!(
                 "[weight_pager] cold-load (async fallback) {id:?} ({} bytes)",
@@ -2506,8 +2530,7 @@ impl WeightPager {
         let target_used = budget.saturating_sub(need_bytes);
         while self.vram_used_bytes > target_used {
             let id = self
-                .lru
-                .pop_front()
+                .lru_pop_oldest()
                 .ok_or(WeightPagerError::BudgetExhausted {
                     need_bytes,
                     in_use: self.vram_used_bytes,
@@ -2549,7 +2572,7 @@ impl WeightPager {
         for (_id, r) in self.resident.drain() {
             let _ = gpu.free_tensor(r.tensor);
         }
-        self.lru.clear();
+        self.lru_clear();
         self.vram_used_bytes = 0;
         self.host_resident.clear();
         self.host_lru.clear();
@@ -2633,19 +2656,49 @@ impl WeightPager {
     pub fn insert_resident(&mut self, id: WeightId, tensor: GpuTensor, bytes: u64) {
         if let Some(prev) = self.resident.remove(&id) {
             self.vram_used_bytes = self.vram_used_bytes.saturating_sub(prev.bytes);
-            self.lru.retain(|x| *x != id);
         }
         self.resident.insert(id, Resident { tensor, bytes });
-        self.lru.push_back(id);
+        self.lru_touch(id);
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(bytes);
     }
 
     /// Mark `id` as recently used. No-op if not resident.
     pub fn touch_lru(&mut self, id: WeightId) {
-        if let Some(pos) = self.lru.iter().position(|x| *x == id) {
-            self.lru.remove(pos);
-            self.lru.push_back(id);
+        if self.resident.contains_key(&id) {
+            self.lru_touch(id);
         }
+    }
+
+    /// Internal: bump `id` to the most-recently-used end of the LRU.
+    /// Allocates a fresh generation; if `id` was already in the LRU,
+    /// removes its prior generation entry first. O(log n).
+    #[inline]
+    fn lru_touch(&mut self, id: WeightId) {
+        if let Some(old_gen) = self.lru_id_to_gen.remove(&id) {
+            self.lru_gen_to_id.remove(&old_gen);
+        }
+        let gen = self.lru_gen_counter;
+        self.lru_gen_counter = self.lru_gen_counter.wrapping_add(1);
+        self.lru_id_to_gen.insert(id, gen);
+        self.lru_gen_to_id.insert(gen, id);
+    }
+
+    /// Internal: pop the least-recently-used entry from the LRU. O(log n).
+    #[inline]
+    fn lru_pop_oldest(&mut self) -> Option<WeightId> {
+        let (_gen, id) = self.lru_gen_to_id.pop_first()?;
+        self.lru_id_to_gen.remove(&id);
+        Some(id)
+    }
+
+    /// Internal: drop all LRU entries (called on `free_all`). Generation
+    /// counter intentionally not reset — keeping it monotonic across the
+    /// lifetime of the pager avoids any risk of re-issuing an already-seen
+    /// generation should a stale id linger anywhere.
+    #[inline]
+    fn lru_clear(&mut self) {
+        self.lru_id_to_gen.clear();
+        self.lru_gen_to_id.clear();
     }
 
     /// Bytes currently held resident. Cheap (cached, not a sum).
@@ -2846,6 +2899,59 @@ mod tests {
         assert_eq!(pager.host_high_water, bytes as usize, "high water never recedes");
         let pool = pager.host_pools.get(&(bytes as usize)).expect("size pool created");
         assert_eq!(pool, &vec![0usize], "freed offset is in the matching size pool");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v0.2 GPU LRU: touch reorders correctly, pop returns oldest.
+    /// Locks in the BTreeMap-backed replacement of the v0.1 VecDeque.
+    #[test]
+    fn lru_touch_reorders_and_pop_returns_oldest() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-lru-touch-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let mut pager =
+            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        let a = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
+        let b = WeightId::Expert { layer: 0, expert: 1, role: ExpertRole::GateUp };
+        let c = WeightId::Expert { layer: 0, expert: 2, role: ExpertRole::GateUp };
+
+        pager.lru_touch(a);
+        pager.lru_touch(b);
+        pager.lru_touch(c);
+        // Insertion order A, B, C → oldest is A.
+        assert_eq!(pager.lru_pop_oldest(), Some(a), "A is oldest after A,B,C");
+        assert_eq!(pager.lru_pop_oldest(), Some(b), "B is now oldest");
+
+        // Re-touch C then add A back → A is now the newest, C is oldest of {C,A}.
+        pager.lru_touch(c);
+        pager.lru_touch(a);
+        assert_eq!(pager.lru_pop_oldest(), Some(c), "C oldest after re-touch C,A");
+        assert_eq!(pager.lru_pop_oldest(), Some(a));
+        assert_eq!(pager.lru_pop_oldest(), None, "empty after draining");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Touching an id already in the LRU must replace its prior generation,
+    /// not leave a duplicate (which would let the same id pop twice).
+    #[test]
+    fn lru_touch_does_not_leave_stale_entries() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-lru-stale-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let mut pager =
+            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        let a = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
+        for _ in 0..5 {
+            pager.lru_touch(a);
+        }
+        assert_eq!(pager.lru_id_to_gen.len(), 1, "id-to-gen has exactly one entry");
+        assert_eq!(pager.lru_gen_to_id.len(), 1, "gen-to-id has exactly one entry");
+        assert_eq!(pager.lru_pop_oldest(), Some(a));
+        assert_eq!(pager.lru_pop_oldest(), None, "no stale duplicate");
 
         let _ = std::fs::remove_file(&path);
     }
