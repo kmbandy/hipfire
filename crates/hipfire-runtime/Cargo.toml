@@ -86,6 +86,10 @@ name = "daemon"
 required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama"]
 
 [[example]]
+name = "gpus_smoke"
+required-features = []
+
+[[example]]
 name = "infer_qwen35"
 required-features = ["arch-qwen35"]
 
@@ -239,4 +243,16 @@ required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "dense_paged_smoke"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp_parity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp_parity_chatml"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
