@@ -1841,6 +1841,26 @@ impl WeightPager {
         if budget == 0 {
             return Ok(());
         }
+        // UMA awareness: on APUs, host RAM and VRAM are the same physical
+        // pool. Allocating a host arena reduces VRAM headroom 1:1, so warn
+        // loudly so the operator knows to size host_budget_bytes against
+        // the *combined* pool, not against system RAM as if the GPU had
+        // its own VRAM. We don't auto-shrink the budget — the operator
+        // owns sizing decisions.
+        let is_apu_part = gpu.hip.get_arch(0)
+            .as_deref()
+            .map(is_apu)
+            .unwrap_or(false);
+        if is_apu_part {
+            eprintln!(
+                "[weight_pager] host arena: detected APU/UMA part — host RAM and \
+                 VRAM share the same physical memory. The {} MB host arena will \
+                 reduce VRAM headroom by the same amount. Verify host_budget_bytes + \
+                 expected VRAM working set fits in your unified pool. (HIPFIRE_PIN_HOST=1 \
+                 will be ignored on this part — see PR #153 review issue #3.)",
+                budget / (1024 * 1024),
+            );
+        }
         // Pre-flight: clamp against actual system memory availability.
         if let Some(avail) = read_mem_available() {
             const SAFETY_MARGIN: usize = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -1882,7 +1902,14 @@ impl WeightPager {
                     budget / (1024 * 1024),
                     t0.elapsed().as_secs_f32(),
                 );
-                if std::env::var_os("HIPFIRE_PIN_HOST").is_some() {
+                if std::env::var_os("HIPFIRE_PIN_HOST").is_some() && is_apu_part {
+                    eprintln!(
+                        "[weight_pager] host arena: HIPFIRE_PIN_HOST=1 ignored on APU/UMA \
+                         — mlock'ing pages that physically back VRAM allocations would \
+                         starve gpu.alloc_tensor and produce silent OOM under pressure. \
+                         The arena stays allocated; only the mlock is skipped."
+                    );
+                } else if std::env::var_os("HIPFIRE_PIN_HOST").is_some() {
                     let t_mlock = std::time::Instant::now();
                     // SAFETY: buf.as_ptr() points at `buf.size()` bytes of
                     // valid Coherent host memory we just allocated. mlock
@@ -2768,6 +2795,24 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
     HfqFile::open(path)
 }
 
+/// `true` when `arch` names an AMD APU — UMA part where host RAM and
+/// VRAM are the same physical pages. Detected by gfx-string prefix
+/// rather than by `hipDeviceAttributeIntegrated` because the integrated
+/// attribute number drifts between ROCm versions and the gfx string is
+/// stable. Covers Strix Point/Halo (gfx115x), Phoenix (gfx1103), and
+/// Renoir/Cezanne-class (gfx90c). Discrete RDNA cards (gfx1010 / gfx1030
+/// / gfx1100 / gfx1200) all return false.
+///
+/// Used by the host-tier arena allocator to skip `mlock` (which on a
+/// UMA part pins pages that VRAM allocations need) and to surface a
+/// warning that the host arena physically competes with VRAM for the
+/// same pool. Per PR #153 review issue #3 / upstream issue #50.
+fn is_apu(arch: &str) -> bool {
+    arch.starts_with("gfx115")   // Strix Point / Halo (gfx1150 / gfx1151 / gfx1152)
+        || arch.starts_with("gfx1103") // Phoenix
+        || arch.starts_with("gfx90c")  // Renoir / Cezanne (older GCN APUs)
+}
+
 /// Parse `/proc/meminfo` for the `MemAvailable:` field — bytes the
 /// kernel believes can be allocated to userspace right now without
 /// going to swap. Used by the pager's host-arena pre-flight to clamp
@@ -2901,6 +2946,27 @@ mod tests {
         assert_eq!(pool, &vec![0usize], "freed offset is in the matching size pool");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// APU / UMA detection by gfx-string prefix. Anchors the v0.3-ε
+    /// behavior changes (skip mlock, surface UMA warning) to the right
+    /// arch family. Per PR #153 review issue #3 / upstream issue #50.
+    #[test]
+    fn is_apu_detects_uma_parts_and_rejects_discrete() {
+        // APUs: Strix family (gfx115x), Phoenix (gfx1103), older GCN APUs (gfx90c).
+        assert!(is_apu("gfx1150"), "Strix Point");
+        assert!(is_apu("gfx1151"), "Strix Halo (Kaden review example)");
+        assert!(is_apu("gfx1152"), "Strix Halo successor (issue #50)");
+        assert!(is_apu("gfx1103"), "Phoenix");
+        assert!(is_apu("gfx90c"),  "Renoir/Cezanne");
+        // Discrete RDNA / GCN — must not trigger the APU path.
+        assert!(!is_apu("gfx1010"), "Navi 10 / 5700 XT");
+        assert!(!is_apu("gfx1030"), "Navi 21 / 6800 XT");
+        assert!(!is_apu("gfx1100"), "Navi 31 / 7900 XTX");
+        assert!(!is_apu("gfx1102"), "Navi 33 — discrete despite middle-digit");
+        assert!(!is_apu("gfx1200"), "Navi 4");
+        assert!(!is_apu("gfx906"),  "Vega 20 / MI50");
+        assert!(!is_apu("unknown"), "graceful on unrecognized strings");
     }
 
     /// v0.2 GPU LRU: touch reorders correctly, pop returns oldest.
