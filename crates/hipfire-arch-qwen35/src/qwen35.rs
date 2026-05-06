@@ -1220,7 +1220,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
             let transport_choice = std::env::var("HIPFIRE_TRANSPORT")
                 .unwrap_or_else(|_| "pread".to_string());
             let pager = match transport_choice.as_str() {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", feature = "transport-p2p"))]
                 "p2p" => {
                     eprintln!("[weight_pager] transport: io_uring + dma_buf P2P (v0.5 NVMe→VRAM direct)");
                     hipfire_runtime::weight_pager::WeightPager::with_iouring_p2p_transport(
@@ -1247,8 +1247,15 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     )))?
                 }
                 other => {
+                    // 'p2p' is intentionally not listed unless the runtime
+                    // crate was built with --features transport-p2p (PR #153
+                    // soft concern: HSA dma_buf export is undocumented and
+                    // ROCm-version-sensitive; gate the experimental path
+                    // behind a compile-time feature so it cannot be
+                    // selected silently on systems where it might produce
+                    // coherent-but-wrong output).
                     return Err(hip_bridge::HipError::new(0, &format!(
-                        "unknown HIPFIRE_TRANSPORT='{other}' — expected 'pread', 'iouring', or 'p2p'"
+                        "unknown HIPFIRE_TRANSPORT='{other}' — expected 'pread' or 'iouring'"
                     )));
                 }
             };

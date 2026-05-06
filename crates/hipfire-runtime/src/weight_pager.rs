@@ -803,7 +803,7 @@ impl Transport for IoUringHostTransport {
 /// scratch ping-pong), a future optimization would cache the
 /// dma_buf+mmap and pass the VA directly without re-exporting; for
 /// v0.5-α we keep it simple.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 pub struct IoUringP2PTransport {
     file: File,
     path: std::path::PathBuf,
@@ -824,7 +824,7 @@ pub struct IoUringP2PTransport {
     hsa_close_fn: HsaCloseDmaBufFn,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 type HsaExportDmaBufFn = unsafe extern "C" fn(
     *const libc::c_void,
     usize,
@@ -832,15 +832,15 @@ type HsaExportDmaBufFn = unsafe extern "C" fn(
     *mut u64,
 ) -> u32;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 type HsaCloseDmaBufFn = unsafe extern "C" fn(i32) -> u32;
 
 // libhsa is dlopen'd once at construction, function pointers are stable
 // for the process lifetime. Safe to send the transport across threads.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 unsafe impl Send for IoUringP2PTransport {}
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 impl IoUringP2PTransport {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         Self::open_with_depth(path, 32)
@@ -1030,7 +1030,7 @@ impl IoUringP2PTransport {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 impl Drop for IoUringP2PTransport {
     fn drop(&mut self) {
         if !self.libhsa.is_null() {
@@ -1039,7 +1039,7 @@ impl Drop for IoUringP2PTransport {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "transport-p2p"))]
 impl Transport for IoUringP2PTransport {
     fn fetch(
         &mut self,
@@ -1566,7 +1566,7 @@ impl WeightPager {
     /// between the NVMe and the GPU. Falls back to kernel-level bounce
     /// when direct P2P isn't available, but the userspace path is the
     /// same in both cases (no host arena needed).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "transport-p2p"))]
     pub fn with_iouring_p2p_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
         let transport = IoUringP2PTransport::open(hfq_path)?;
         Ok(Self::new(Box::new(transport), config))

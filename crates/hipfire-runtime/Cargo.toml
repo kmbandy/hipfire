@@ -45,6 +45,15 @@ deltanet = ["rdna-compute/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
+# v0.5 NVMe → VRAM P2P via dma_buf + io_uring. Off by default — the HSA
+# dma_buf export API (`hsa_amd_portable_export_dmabuf`) is undocumented
+# and ROCm-version-sensitive, and the v0.5-α path is "correctness verified,
+# performance deferred." Building with `--features transport-p2p` enables
+# the `IoUringP2PTransport` implementation and the `HIPFIRE_TRANSPORT=p2p`
+# selector. Without this feature, `HIPFIRE_TRANSPORT=p2p` returns the
+# normal "unknown transport" error rather than silently selecting an
+# experimental path. Per PR #153 review (soft concern).
+transport-p2p = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }

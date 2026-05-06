@@ -10,6 +10,12 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+# Passthrough for the runtime's experimental v0.5 P2P transport. Off by
+# default; enable with `--features hipfire-arch-qwen35/transport-p2p`
+# (or `hipfire-runtime/transport-p2p` directly when building the runtime
+# crate). Unlocks the `HIPFIRE_TRANSPORT=p2p` selector. Per PR #153 soft
+# concern.
+transport-p2p = ["hipfire-runtime/transport-p2p"]
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
