@@ -1458,6 +1458,15 @@ struct Resident {
     tensor: GpuTensor,
     /// Cached byte length so eviction can update `vram_used_bytes` cheaply.
     bytes: u64,
+    /// `true` for entries inserted via [`WeightPager::insert_resident`]
+    /// (always-resident loader weights: token embeds, output norm, the
+    /// router itself in v0.1). The catalog is **not** populated for these
+    /// — the loader holds the raw bytes, not a [`ByteRange`] — so they
+    /// can't be re-faulted from disk. Eviction skips them; if the budget
+    /// is too small to hold them plus the working set, the eviction loop
+    /// returns `BudgetExhausted` rather than evicting an irreplaceable
+    /// entry. Per PR #153 review issue #4.
+    pinned: bool,
 }
 
 /// Big shared arena for the host tier. Tagged so callers can tell
@@ -1691,7 +1700,7 @@ impl WeightPager {
             t
         };
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
-        self.resident.insert(id, Resident { tensor, bytes: need });
+        self.resident.insert(id, Resident { tensor, bytes: need, pinned: false });
         self.lru_touch(id);
         Ok(())
     }
@@ -1757,7 +1766,7 @@ impl WeightPager {
                 dtype: rdna_compute::DType::Raw,
             };
             self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
-            self.resident.insert(id, Resident { tensor, bytes: need });
+            self.resident.insert(id, Resident { tensor, bytes: need, pinned: false });
             self.lru_touch(id);
             let idx = self.transfer_events.len();
             self.transfer_events.push(evt);
@@ -1768,7 +1777,7 @@ impl WeightPager {
         // the bytes are already in VRAM; no event needed.
         let (tensor, _h) = self.transport.fetch(range.offset, range.len, gpu)?;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
-        self.resident.insert(id, Resident { tensor, bytes: need });
+        self.resident.insert(id, Resident { tensor, bytes: need, pinned: false });
         self.lru_touch(id);
         if self.config.trace {
             eprintln!(
@@ -2555,14 +2564,21 @@ impl WeightPager {
         let budget = self.config.vram_budget_bytes;
         // How much we need to free so that vram_used + need <= budget.
         let target_used = budget.saturating_sub(need_bytes);
-        while self.vram_used_bytes > target_used {
-            let id = self
-                .lru_pop_oldest()
-                .ok_or(WeightPagerError::BudgetExhausted {
+        // Pinned LRU entries we tried to evict but had to skip (no catalog
+        // entry → not re-faultable). Re-touched at the end so they slide
+        // back to the MRU end and don't get re-popped on the next call.
+        let mut skipped_pinned: Vec<WeightId> = Vec::new();
+        let result = loop {
+            if self.vram_used_bytes <= target_used {
+                break Ok(());
+            }
+            let Some(id) = self.lru_pop_oldest() else {
+                break Err(WeightPagerError::BudgetExhausted {
                     need_bytes,
                     in_use: self.vram_used_bytes,
                     budget,
-                })?;
+                });
+            };
             // Drift guard: the LRU should always contain the same set of
             // ids as `resident`. If they diverge (e.g. a future caller
             // forgets to update both maps in lockstep), we'd silently
@@ -2575,6 +2591,15 @@ impl WeightPager {
                 "weight_pager invariant: lru contains {id:?} but resident does not — \
                  drift between LRU queue and residency map"
             );
+            // Pinned (insert_resident'd) entries are not re-faultable from
+            // disk — the catalog has no ByteRange for them. Skip and keep
+            // looking for an evictable victim. See PR #153 review issue #4.
+            if let Some(r) = self.resident.get(&id) {
+                if r.pinned {
+                    skipped_pinned.push(id);
+                    continue;
+                }
+            }
             if let Some(r) = self.resident.remove(&id) {
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);
@@ -2587,8 +2612,13 @@ impl WeightPager {
                     );
                 }
             }
+        };
+        // Re-insert the pinned entries we passed over so they're tracked
+        // in the LRU again (touched as MRU — they were just visited).
+        for id in skipped_pinned {
+            self.lru_touch(id);
         }
-        Ok(())
+        result
     }
 
     /// Free all resident tensors back to the GPU pool. Also frees the
@@ -2680,11 +2710,18 @@ impl WeightPager {
     /// always-resident weights (token embeds, norms, the router itself in
     /// v0.1) — they live in VRAM from startup but the pager tracks them so
     /// they're visible to `get()` and accounted in `vram_used_bytes`.
+    ///
+    /// Marks the entry `pinned: true`. The catalog is **not** populated
+    /// for these (the loader holds the bytes, not a [`ByteRange`]), so
+    /// they cannot be re-faulted from disk. [`Self::evict_lru_until`]
+    /// skips pinned entries; if the budget is too small to hold them
+    /// plus the working set, eviction returns `BudgetExhausted` rather
+    /// than evicting an irreplaceable entry. Per PR #153 review issue #4.
     pub fn insert_resident(&mut self, id: WeightId, tensor: GpuTensor, bytes: u64) {
         if let Some(prev) = self.resident.remove(&id) {
             self.vram_used_bytes = self.vram_used_bytes.saturating_sub(prev.bytes);
         }
-        self.resident.insert(id, Resident { tensor, bytes });
+        self.resident.insert(id, Resident { tensor, bytes, pinned: true });
         self.lru_touch(id);
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(bytes);
     }
@@ -2944,6 +2981,47 @@ mod tests {
         assert_eq!(pager.host_high_water, bytes as usize, "high water never recedes");
         let pool = pager.host_pools.get(&(bytes as usize)).expect("size pool created");
         assert_eq!(pool, &vec![0usize], "freed offset is in the matching size pool");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PR #153 review issue #4: insert_resident must mark the entry pinned
+    /// AND the catalog must remain empty for that id (the loader holds the
+    /// bytes; there's no ByteRange to re-fault from). Together these mean
+    /// `evict_lru_until` will skip the entry rather than evicting an
+    /// irrecoverable resident.
+    #[test]
+    fn insert_resident_marks_entry_pinned_and_skips_catalog() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pinned-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        let mut pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        let id = WeightId::Norm { layer: 0, kind: NormKind::Final };
+        let bytes: u64 = 4096;
+        // Synthetic non-owning DeviceBuffer — the test never frees this
+        // because pinned entries skip the eviction path that calls
+        // gpu.free_tensor.
+        let fake_buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), bytes as usize)
+        };
+        let fake_tensor = GpuTensor {
+            buf: fake_buf,
+            shape: vec![bytes as usize],
+            dtype: DType::Raw,
+        };
+        pager.insert_resident(id, fake_tensor, bytes);
+
+        let r = pager.resident.get(&id).expect("inserted entry must be resident");
+        assert!(r.pinned, "insert_resident must set pinned: true");
+        assert!(
+            pager.byte_range_of(id).is_none(),
+            "insert_resident must NOT touch the catalog — there's no ByteRange to record"
+        );
+        assert!(
+            pager.is_resident(id),
+            "is_resident reports the entry is in VRAM"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
