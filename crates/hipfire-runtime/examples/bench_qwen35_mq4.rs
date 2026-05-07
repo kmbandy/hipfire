@@ -44,7 +44,7 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     eprintln!(
         "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
@@ -57,7 +57,7 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
@@ -223,8 +223,16 @@ fn main() {
     }
 
     // === GEN BENCHMARK ===
+    // HIPFIRE_PROFILE_DECODE=1 wraps the timed gen loop in the per-kernel
+    // profiler. Distinct from HIPFIRE_PROFILE=1 (which profiles prefill).
+    // Decode is the steady-state hot path — this is the right surface to
+    // attack for tok/s improvements.
+    let do_profile_decode = std::env::var("HIPFIRE_PROFILE_DECODE").ok().as_deref() == Some("1");
     eprintln!("\n=== gen ({gen_len} tokens — timed) ===");
     let mut per_token_ms: Vec<f64> = Vec::with_capacity(gen_len);
+    if do_profile_decode {
+        rdna_compute::profile::start();
+    }
     let t_gen_start = Instant::now();
     for step in 0..gen_len {
         let pos = prefill_len + warmup_len + step;
@@ -240,6 +248,29 @@ fn main() {
         next_token = llama::argmax(&logits);
     }
     let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
+    if do_profile_decode {
+        if let Some(entries) = rdna_compute::profile::stop() {
+            let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> = Default::default();
+            for e in &entries {
+                let (time, count, bytes) = by_kernel.entry(e.kernel).or_default();
+                *time += e.time_us;
+                *count += 1;
+                *bytes += e.bytes;
+            }
+            eprintln!("\n=== DECODE PROFILE ({} launches, {:.1}ms wall) ===", entries.len(), gen_total_ms);
+            let mut kerns: Vec<_> = by_kernel.iter().collect();
+            kerns.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+            let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
+            for (kern, (us, n, bytes)) in &kerns {
+                let gib_s = if *us > 0.0 {
+                    (*bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (*us / 1_000_000.0)
+                } else { 0.0 };
+                eprintln!("  {kern:45} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
+                    us / 1000.0, us / *n as f64, us / total_us * 100.0, gib_s);
+            }
+            eprintln!("  {:45} {:5}   {:.1}ms", "TOTAL (serialized)", "", total_us / 1000.0);
+        }
+    }
 
     // Stats
     let mut sorted = per_token_ms.clone();

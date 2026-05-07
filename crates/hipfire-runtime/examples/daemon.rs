@@ -590,8 +590,10 @@ fn main() {
                 let pp = msg.get("params").and_then(|p| p.get("pp"))
                     .and_then(|v| v.as_u64()).unwrap_or(1) as usize;
                 if pp > 1 {
-                    if draft_path.is_some() {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#);
+                    if draft_path.is_some()
+                        && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
+                    {
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap."}}"#);
                         let _ = stdout.flush();
                         continue;
                     }
@@ -600,8 +602,10 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    if pflash_drafter.is_some() || pflash_mode_str != "off" {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#);
+                    if (pflash_drafter.is_some() || pflash_mode_str != "off")
+                        && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
+                    {
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#);
                         let _ = stdout.flush();
                         continue;
                     }
@@ -1089,7 +1093,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
 
@@ -1285,7 +1289,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq).ok();
         let (vision_config, vision_weights) = if let Some(vc) = vision_config {
             if has_vision_tensors {
-                let vw = <Qwen35Vl as Architecture>::load_weights(&hfq, &vc, gpu)
+                let vw = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vc, gpu)
                     .map_err(|e| format!("{e}"))?;
                 eprintln!("  VL model: vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
                 (Some(vc), Some(vw))
@@ -1296,7 +1300,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             (None, None)
         };
 
-        let weights = <Qwen35 as Architecture>::load_weights(&hfq, &config, gpu)?;
+        let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
 
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
@@ -1443,7 +1447,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         use hipfire_runtime::arch::Architecture;
         let config = <Llama as Architecture>::config_from_hfq(&hfq)
             .map_err(|e| e.to_string())?;
-        let weights = <Llama as Architecture>::load_weights(&hfq, &config, gpu)?;
+        let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, gpu)?;
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
@@ -1501,7 +1505,34 @@ fn load_model_pp(
 
     let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
 
-    let mut gpus = Gpus::init_uniform(pp, config.n_layers).map_err(|e| format!("{e}"))?;
+    // HIPFIRE_PP_LAYERS="a,b,..." overrides uniform split. Length must equal
+    // pp; sum must equal n_layers; each entry >= 1. Used to shift layers off
+    // dev 0 when token_embd asymmetry caps max_seq under uniform split.
+    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS").ok().filter(|s| !s.is_empty()) {
+        Some(spec) => {
+            let counts: Result<Vec<usize>, _> = spec
+                .split(',')
+                .map(|s| s.trim().parse::<usize>())
+                .collect();
+            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+            if counts.len() != pp {
+                return Err(format!(
+                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+                    counts.len(), pp
+                ));
+            }
+            let sum: usize = counts.iter().sum();
+            if sum != config.n_layers {
+                return Err(format!(
+                    "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
+                    sum, config.n_layers
+                ));
+            }
+            eprintln!("  HIPFIRE_PP_LAYERS override: {:?}", counts);
+            Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+        }
+        None => Gpus::init_uniform(pp, config.n_layers).map_err(|e| format!("{e}"))?,
+    };
 
     let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).map_err(|e| format!("{e}"))?;
 
@@ -2317,6 +2348,9 @@ fn generate_dflash(
 #[allow(clippy::too_many_arguments)]
 fn generate_multi(
     m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2362,7 +2396,70 @@ fn generate_multi(
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
-    let q_tokens = tokenizer.encode(prompt);
+    let raw_q_tokens = tokenizer.encode(prompt);
+
+    // PFlash compression on first turn (seq_pos == 0). Drafter runs on the
+    // daemon's single-GPU `gpu` handle, which binds to the same physical
+    // device as `pp_gpus.devices[0]` (HIP enumerates within ROCR_VISIBLE).
+    // VRAM is shared between the two Gpu handles via the HIP heap, so
+    // drafter weights coexist with the target's dev 0 portion. Output is
+    // a Vec<u32> of kept token IDs which feeds forward_prefill_batch_multi
+    // unchanged. Mode=Off / drafter unloaded falls through to raw tokens.
+    let request_kind = match tokenizer.special_token_id("<tool_call>") {
+        Some(tid) => {
+            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
+            let in_system = system_prompt
+                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
+                .unwrap_or(false);
+            if in_user || in_system {
+                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
+            } else {
+                hipfire_arch_qwen35::pflash::RequestKind::Text
+            }
+        }
+        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
+    };
+    let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
+        if m.seq_pos == 0 {
+            match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
+                gpu, state, cfg, &raw_q_tokens, request_kind, &[],
+            ) {
+                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
+                        id, cp.source_tokens, cp.kept_tokens,
+                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+                        cp.source_md5, cp.compressed_md5,
+                        cp.timings.score_ms, cp.timings.total_ms,
+                    );
+                    let _ = stdout.flush();
+                    cp.token_ids
+                }
+                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
+                    if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
+                        let _ = writeln!(stdout,
+                            r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
+                            id, reason.as_str().replace('"', "'"),
+                        );
+                        let _ = stdout.flush();
+                    }
+                    raw_q_tokens
+                }
+                Err(e) => {
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
+                        id, e.to_string().replace('"', "'"),
+                    );
+                    let _ = stdout.flush();
+                    raw_q_tokens
+                }
+            }
+        } else {
+            raw_q_tokens
+        }
+    } else {
+        raw_q_tokens
+    };
 
     // ChatML framing via the canonical hipfire_runtime::prompt_frame module.
     // Identical to the pp=1 path so multi-turn behavior matches byte-for-byte
@@ -2671,10 +2768,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
-        let _ = (gpu, pflash_state, pflash_cfg);
         generate_multi(
-            m, stdout, id, prompt, system_prompt, temp, top_p, max_tokens,
-            repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, repeat_penalty, repeat_window,
+            budget_alert_at_tok, budget_alert_text, max_think_tokens,
         );
         return;
     }
