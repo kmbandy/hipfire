@@ -88,3 +88,4 @@ research/
 
 # Scratch research bundles (raw PR diffs, model-conversion test artifacts)
 .codeinsight+research/
+.gitnexus
