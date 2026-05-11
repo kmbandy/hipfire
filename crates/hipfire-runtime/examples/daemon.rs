@@ -121,6 +121,49 @@ struct CaskConfig {
 /// helper below is the simpler fallback for unpaired tokens — trips on
 /// `count >= threshold` regardless of structure — kept here as
 /// reference for a future per-token attractor block.
+//
+// ─── Probe-mode `committed` event emitter ────────────────────────────────
+//
+// When `HIPFIRE_EMIT_TOKEN_IDS=1` is set, the daemon emits a
+// `{"type":"committed",...}` event for every token it commits (i.e. every
+// time a sampled token is appended to `streamed_tokens` /
+// `conversation_tokens`). This is a parallel stream alongside the
+// existing `{"type":"token","text":"..."}` events; it carries the raw
+// token ID, the per-request position, and ms-since-request-start.
+//
+// Why a parallel stream and not a `tok_id` field on the existing token
+// event: `EosFilter` can hold/merge/strip/stop bytes across multiple
+// committed tokens (many-to-one and zero-to-one relationships); a
+// `tok_id` field on a text event would lie about which token produced
+// the visible chunk. The runtime-protective synthetic emit at the
+// `</think>` force-close site is intentionally NOT paired with a
+// `committed` event, because no token was actually committed there.
+//
+// Off by default — env var read once on first call. The probe binary
+// (`examples/coherence_probe.rs`) sets the env on the daemon child it
+// spawns. Existing JSONL clients see no change.
+fn emit_committed_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    tok_id: u32,
+    pos: usize,
+    t_ms: u64,
+) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let on = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1")
+    });
+    if !on {
+        return;
+    }
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"committed","id":"{}","tok_id":{},"pos":{},"t_ms":{}}}"#,
+        id, tok_id, pos, t_ms
+    );
+}
+
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -312,6 +355,15 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    // Upstream HF Jinja chat_template, extracted from the HFQ
+    // `tokenizer_config.chat_template` at load time. `None` when the source
+    // model didn't ship one (rare for instruct models). Only consumed when
+    // `HIPFIRE_JINJA_CHAT=1` is set; otherwise the daemon's hand-rolled
+    // `prompt_frame::ChatFrame::Plain` scaffolding is used as today.
+    //
+    // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
+    // VL paths still hit the Plain scaffold.
+    chat_template: Option<String>,
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -624,6 +676,39 @@ fn main() {
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else { (0, 0, 0) };
+                        // ── Optional DPM stabilization (perf instrumentation) ──
+                        //
+                        // Pins the GPU at high sclk/mclk so the first `generate`
+                        // request doesn't pay the 1-10s DPM ramp from idle. Same
+                        // `HIPFIRE_DPM_WARMUP_SECS` env the in-process bench tools
+                        // honor (`bench_qwen35_mq4`, `dflash_spec_demo`,
+                        // `bench_stream_overlap`); see
+                        // `crates/rdna-compute/src/dispatch.rs::dpm_warmup` and
+                        // `docs/methodology/perf-benchmarking.md`.
+                        //
+                        // Runs AFTER weight upload but BEFORE the `loaded` ack so
+                        // the contract becomes "loaded means daemon is fully ready
+                        // including DPM-pinned." Critical for probe-side timing:
+                        // if warmup ran AFTER the ack, the probe would receive
+                        // `loaded`, immediately send `generate`, and the daemon
+                        // (still warming up in this handler) wouldn't process the
+                        // generate until warmup finished — folding the warmup
+                        // into the probe-measured TTFT and breaking
+                        // `tok_s = total_tokens / wall_ms`. With warmup before the
+                        // ack, the probe sees `loaded` only when the daemon is
+                        // truly ready, and TTFT measures real prefill alone.
+                        //
+                        // Default OFF (production daemon load latency unchanged).
+                        if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+                            if let Ok(secs) = secs_str.parse::<f32>() {
+                                if secs > 0.0 {
+                                    if let Err(e) = gpu.dpm_warmup(secs) {
+                                        eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
+                                    }
+                                }
+                            }
+                        }
+
                         let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -767,6 +852,16 @@ fn main() {
                 let max_think_tokens = msg.get("max_think_tokens")
                     .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
+                // assistant_prefix: "plain", "open_think", or "closed_think"
+                // Controls the ChatML framing after the assistant role header.
+                let assistant_prefix = match msg.get("assistant_prefix")
+                    .and_then(|v| v.as_str()).unwrap_or("plain")
+                {
+                    "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
+                    "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                    _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                };
+
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
@@ -830,6 +925,7 @@ fn main() {
                         m, &mut gpu, &mut stdout, id, prompt, system,
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
                     );
@@ -1074,6 +1170,76 @@ fn main() {
             }
         }
     }
+}
+
+/// Resolve the chat_template to use for a loaded model, walking the
+/// override-precedence chain:
+///
+///   1. `HIPFIRE_CHAT_TEMPLATE_FILE` env var → if set and file readable,
+///      that template wins. Operator escape hatch / debugging knob.
+///   2. Per-model file at `~/.hipfire/templates/<sanitized-tag>.j2`
+///      where the tag is derived from the model file basename
+///      (`qwen3.5-9b.mq4` → `qwen3.5-9b.mq4.j2`). User-controllable
+///      override for a specific model without env-var globalness.
+///   3. HFQ-embedded `tokenizer_config.chat_template`. Default — what
+///      the model was trained with.
+///   4. None of the above → `None`. The render path falls back to the
+///      hand-rolled `ChatFrame::Plain` scaffold (current default
+///      behavior under Stage 2's `HIPFIRE_JINJA_CHAT=1` gate). Stage 5+
+///      will tighten this to a hard error once Plain is removed.
+///
+/// Per-request inline override (`chat_template_kwargs.chat_template`,
+/// vLLM-style) is the responsibility of the per-request render call,
+/// not load-time resolution. It belongs in Stage 5 alongside the CLI
+/// passthrough refactor; this resolver only handles the load-time
+/// sources.
+fn resolve_chat_template(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    model_path: &str,
+) -> Option<String> {
+    // 1. Env-var override.
+    if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
+        if !env_path.is_empty() {
+            match std::fs::read_to_string(&env_path) {
+                Ok(s) => {
+                    eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}", env_path);
+                    return Some(s);
+                }
+                Err(e) => eprintln!(
+                    "[chat_template] HIPFIRE_CHAT_TEMPLATE_FILE={env_path} failed to read ({e}); falling through"
+                ),
+            }
+        }
+    }
+
+    // 2. Per-model file at ~/.hipfire/templates/<basename>.j2.
+    if let Some(home) = std::env::var_os("HOME") {
+        let basename = std::path::Path::new(model_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !basename.is_empty() {
+            let per_model = std::path::Path::new(&home)
+                .join(".hipfire")
+                .join("templates")
+                .join(format!("{basename}.j2"));
+            if per_model.is_file() {
+                match std::fs::read_to_string(&per_model) {
+                    Ok(s) => {
+                        eprintln!("[chat_template] using per-model override {}", per_model.display());
+                        return Some(s);
+                    }
+                    Err(e) => eprintln!(
+                        "[chat_template] per-model file {} failed to read ({e}); falling through",
+                        per_model.display()
+                    ),
+                }
+            }
+        }
+    }
+
+    // 3. HFQ-embedded.
+    hfq.chat_template()
 }
 
 fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
@@ -1424,6 +1590,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             }
         } else { None };
 
+        let chat_template = resolve_chat_template(&hfq, path);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
@@ -1436,6 +1603,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            chat_template,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -1451,6 +1619,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
+        let chat_template = resolve_chat_template(&hfq, path);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
@@ -1463,6 +1632,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            chat_template,
         })
     }
 }
@@ -1591,6 +1761,7 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
+        chat_template: resolve_chat_template(&hfq, path),
     })
 }
 
@@ -1921,6 +2092,7 @@ fn generate_dflash(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
 ) {
@@ -1936,7 +2108,7 @@ fn generate_dflash(
         tokenizer,
         system: system_prompt,
         user: prompt,
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        assistant_prefix,
         raw: false,
     }
     .build();
@@ -2120,6 +2292,7 @@ fn generate_dflash(
 
     // Emit the first token immediately so TTFT is the prefill time.
     streamed_tokens.push(first_token);
+    emit_committed_event(stdout, id, first_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
     let new_bytes = &all_bytes[bytes_fed_to_filter..];
     bytes_fed_to_filter = all_bytes.len();
@@ -2238,6 +2411,7 @@ fn generate_dflash(
             if generated >= max_tokens { break; }
             emitted.push(tok);
             streamed_tokens.push(tok);
+            emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
@@ -2363,6 +2537,7 @@ fn generate_multi(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -2468,7 +2643,7 @@ fn generate_multi(
         tokenizer,
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "",
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        assistant_prefix,
         raw: false,
     }
     .build_with_user_tokens(&q_tokens);
@@ -2577,6 +2752,7 @@ fn generate_multi(
         generated += 1;
         m.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[bytes_fed_to_filter..];
         bytes_fed_to_filter = all_bytes.len();
@@ -2627,6 +2803,7 @@ fn generate_multi(
                     m.seq_pos += 1;
                     m.conversation_tokens.push(t);
                     streamed_tokens.push(t);
+                    emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes = &all_bytes[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes.len();
@@ -2693,6 +2870,7 @@ fn generate_multi(
                 for &tok in &nudge_tokens[..nudge_len] {
                     m.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
+                    emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                     let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes2.len();
@@ -2763,7 +2941,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
@@ -2772,13 +2950,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
             budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            assistant_prefix,
         );
         return;
     }
     // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
-    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
+    //
+    // Exception: thinking-on + max_think_tokens currently needs the AR path.
+    // DFlash's budget cap can close/strip the think span but does not yet
+    // continue into visible answer text after the forced close. AR already
+    // splices </think> through KV and continues generation, so route budgeted
+    // thinking requests there until DFlash continuation is implemented.
+    let budgeted_thinking_needs_ar = max_think_tokens > 0
+        && !matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
+    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar {
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so
@@ -2803,7 +2990,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, dflash_bypass_reason, dflash_alpha);
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
@@ -2979,19 +3166,68 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         raw_q_tokens
     };
 
-    // ChatML framing via the canonical hipfire_runtime::prompt_frame module.
-    // System prompt is prepended only on the first turn (seq_pos == 0)
-    // — subsequent turns continue the conversation in-place. The user
-    // body comes in pre-tokenized as `q_tokens` because PFlash may
-    // have compressed it upstream.
-    let new_tokens = hipfire_runtime::prompt_frame::ChatFrame {
-        tokenizer,
-        system: if m.seq_pos == 0 { system_prompt } else { None },
-        user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
-    }
-    .build_with_user_tokens(&q_tokens);
+    // ChatML framing — two paths:
+    //
+    //   1) `HIPFIRE_JINJA_CHAT=1` AND model carries an embedded chat_template
+    //      AND first turn (seq_pos == 0): render through `JinjaChatFrame`
+    //      against the upstream HF Jinja template, producing the byte
+    //      sequence the model was actually trained on (fixes the "hand-roll
+    //      drifted from upstream template" class — XML tool calls on
+    //      Qwen3.5/3.6 instead of JSON, `<|im_start|>user` for tool
+    //      responses instead of `<|im_start|>tool`, etc.). PFlash
+    //      compression is bypassed under Jinja for now (q_tokens not
+    //      reusable when the template renders to a String).
+    //
+    //   2) Default: hand-rolled `prompt_frame::ChatFrame::Plain`
+    //      scaffold, byte-identical to today's behavior.
+    //
+    // Multi-turn (seq_pos > 0) currently always uses path 2 — Jinja
+    // single-turn parity is Stage 2; multi-turn message-history state on
+    // the daemon side is Stage 2 follow-up.
+    //
+    // Thinking-off interop with `assistant_prefix`: the CLI sets BOTH
+    // `max_think_tokens = 1` AND `assistant_prefix = ClosedThink` when
+    // the request asks for non-thinking. The Jinja path keys off
+    // `max_think_tokens != 1` for `enable_thinking`; the Plain path
+    // honors `assistant_prefix` directly (ClosedThink emits a closed
+    // `<think></think>` block after the assistant prefix). Each path
+    // picks up the signal it needs.
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    let new_tokens = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        match frame.render() {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(&q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: if m.seq_pos == 0 { system_prompt } else { None },
+            user: "", // unused: we pass tokens directly via build_with_user_tokens
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&q_tokens)
+    };
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
@@ -3212,6 +3448,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             // Incremental UTF-8 + filter routing: feed only the new
             // bytes since last call, let the filter buffer any partial
             // codepoint or marker prefix until disambiguated.
@@ -3291,6 +3528,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         }
                         m.conversation_tokens.push(t);
                         streamed_tokens.push(t);
+                        emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[bytes_fed_to_filter..];
                         bytes_fed_to_filter = all_bytes.len();
@@ -3395,6 +3633,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
+                        emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         // Emit the injected token's text to stdout so the client
                         // sees it as part of the stream (will be inside <think>
                         // if that's the current state, and get stripped client-
@@ -3538,6 +3777,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
@@ -3670,7 +3910,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         tokenizer,
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
         raw: false,
     }
     .build_with_user_tokens(&user_body);
@@ -3757,6 +3997,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     for _ in 0..max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, generated - 1, t0.elapsed().as_millis() as u64);
         let text = tokenizer.decode(&[next_token]);
         let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
         let _ = stdout.flush();

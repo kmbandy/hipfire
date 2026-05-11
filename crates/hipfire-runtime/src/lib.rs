@@ -10,6 +10,7 @@
 //! [`arch::Architecture`] trait.
 
 pub mod arch;
+pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod llama;
@@ -31,3 +32,4 @@ pub mod weight_pager;
 pub mod tokenizer;
 pub mod eos_filter;
 pub mod prompt_frame;
+pub mod tool_call;

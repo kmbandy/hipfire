@@ -64,6 +64,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 rayon = "1"
+# Renders the upstream HF chat_template (Jinja) when present in
+# .hfq metadata, so prompt framing matches what the model was
+# trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`
+# scaffolding when the template is absent or fails to render.
+# `json` enables the `tojson` filter — Qwen3.5/3.6 + Gemma 4 tool-rendering
+# branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
+# inside the system block; without it, tool-using turns die at render time
+# (caught by jinja_smoke scenario C, 2026-05-09).
+minijinja = { version = "2", features = ["loop_controls", "json"] }
+# `pycompat` ships an unknown-method callback that makes Python
+# str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
+# work on plain Jinja values — required by the Qwen3 family
+# template which uses these throughout.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -80,6 +94,7 @@ io-uring = "0.7"
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-detect = { path = "../hipfire-detect" }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -93,6 +108,10 @@ hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 [[example]]
 name = "daemon"
 required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama"]
+
+[[example]]
+name = "coherence_probe"
+required-features = []
 
 [[example]]
 name = "gpus_smoke"
@@ -269,3 +288,25 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
+
+# build_kld_ref needs no GPU / arch features — it just orchestrates
+# llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
+[[example]]
+name = "build_kld_ref"
+required-features = []
+
+[[example]]
+name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
+
+# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
+# No GPU / arch features needed (tokenizer is pure CPU).
+[[example]]
+name = "tokenize_slice"
+required-features = []
+
+# eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "eval_gguf"
+required-features = []
